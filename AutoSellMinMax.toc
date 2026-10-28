@@ -1,0 +1,8 @@
+## Interface: 11509
+## Title: AutoSellMinMax
+## Notes: Automatically sells grey items and items you register, when you open a vendor.
+## Author: Manuel Metzger
+## Version: 1.0.0
+## SavedVariables: AutoSellMinMaxDB
+
+AutoSellMinMax.lua
