@@ -118,9 +118,21 @@ local function CountStacks(itemID)
     return stacks, items
 end
 
+local QUEST_CLASS_ID = 12 -- Enum.ItemClass.Questitem
+local BIND_QUEST = 4
+
+local function IsQuestItem(itemID)
+    local _, _, _, _, _, itemType, _, _, _, _, _, classID, _, bindType = GetItemInfo(itemID)
+    return classID == QUEST_CLASS_ID or itemType == "Quest" or bindType == BIND_QUEST
+end
+
 local function Register(itemID, link)
-    db.registered[itemID] = true
     link = link or select(2, GetItemInfo(itemID)) or ("item " .. itemID)
+    if IsQuestItem(itemID) then
+        Print(link .. " is a |cffff4040quest item|r and cannot be added to the auto-sell list.")
+        return
+    end
+    db.registered[itemID] = true
     Print(link .. " added to the auto-sell list.")
     local label = BlockedLabel(select(3, GetItemInfo(itemID)))
     if label then WarnBlocked(link, label) end
@@ -151,6 +163,7 @@ end
 local function ShouldSell(link, quality, hasNoValue)
     if not link or hasNoValue then return false end
     local itemID = ItemIDFromLink(link)
+    if IsQuestItem(itemID) then return false end -- never sell quest items
     local registered = IsRegistered(itemID)
 
     if quality == 0 then
@@ -424,6 +437,79 @@ local function TogglePanel()
 end
 
 ---------------------------------------------------------------------------
+-- Entry in Esc -> Options -> AddOns
+---------------------------------------------------------------------------
+
+local function Metadata(field)
+    local get = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+    return get(ADDON, field) or "?"
+end
+
+local function CreateInfoPanel()
+    local info = CreateFrame("Frame", "AutoSellMinMaxInfoPanel")
+    info.name = ADDON
+
+    local title = info:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", 16, -16)
+    title:SetText(ADDON)
+
+    local notes = info:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    notes:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
+    notes:SetWidth(520)
+    notes:SetJustifyH("LEFT")
+    notes:SetText(Metadata("Notes"))
+
+    local lines = {
+        { "Author", Metadata("Author") },
+        { "Version", Metadata("Version") },
+    }
+    local last = notes
+    for _, l in ipairs(lines) do
+        local fs = info:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+        fs:SetPoint("TOPLEFT", last, "BOTTOMLEFT", 0, -12)
+        fs:SetText("|cffffd100" .. l[1] .. ":|r " .. l[2])
+        last = fs
+    end
+
+    local links = {
+        { "GitHub", Metadata("X-Source") },
+        { "CurseForge", Metadata("X-Website") },
+    }
+    for _, l in ipairs(links) do
+        local label = info:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+        label:SetPoint("TOPLEFT", last, "BOTTOMLEFT", 0, -14)
+        label:SetText(l[1] .. " (Ctrl+C to copy):")
+        local box = CreateFrame("EditBox", nil, info, "InputBoxTemplate")
+        box:SetSize(480, 20)
+        box:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 6, -4)
+        box:SetAutoFocus(false)
+        box:SetText(l[2])
+        box:SetCursorPosition(0)
+        box:SetScript("OnEditFocusLost", function(self) self:SetText(l[2]); self:HighlightText(0, 0) end)
+        box:SetScript("OnEscapePressed", box.ClearFocus)
+        last = box
+    end
+
+    local open = CreateFrame("Button", nil, info, "UIPanelButtonTemplate")
+    open:SetSize(160, 24)
+    open:SetPoint("TOPLEFT", last, "BOTTOMLEFT", -6, -20)
+    open:SetText("Open item list")
+    open:SetScript("OnClick", function()
+        if HideUIPanel and GameMenuFrame then HideUIPanel(GameMenuFrame) end
+        if InterfaceOptionsFrame then InterfaceOptionsFrame:Hide() end
+        if SettingsPanel and SettingsPanel:IsShown() then HideUIPanel(SettingsPanel) end
+        panel:Show()
+    end)
+
+    if Settings and Settings.RegisterCanvasLayoutCategory then
+        local category = Settings.RegisterCanvasLayoutCategory(info, ADDON)
+        Settings.RegisterAddOnCategory(category)
+    elseif InterfaceOptions_AddCategory then
+        InterfaceOptions_AddCategory(info)
+    end
+end
+
+---------------------------------------------------------------------------
 -- Top-right bar
 ---------------------------------------------------------------------------
 
@@ -494,6 +580,7 @@ f:SetScript("OnEvent", function(_, event, arg1)
 
         CreateBar()
         CreatePanel()
+        CreateInfoPanel()
 
         -- Alt+Left-click on a bag item toggles registration.
         hooksecurefunc("HandleModifiedItemClick", function(link)

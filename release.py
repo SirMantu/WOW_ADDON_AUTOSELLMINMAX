@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 NAME = "AutoSellMinMax"
-FILES = ["AutoSellMinMax.lua", "AutoSellMinMax.toc", "README.md", "LICENSE"]
+FILES = ["AutoSellMinMax.lua", "AutoSellMinMax.toc", "README.md", "CHANGELOG.md", "LICENSE"]
 
 root = Path(__file__).resolve().parent
 folder = root / NAME
