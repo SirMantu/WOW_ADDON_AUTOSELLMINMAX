@@ -29,6 +29,55 @@ local function Print(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99" .. ADDON .. "|r: " .. msg)
 end
 
+-- Newer clients moved these into C_Item and removed the globals.
+local GetItemInfo = _G.GetItemInfo or (C_Item and C_Item.GetItemInfo)
+local GetItemInfoInstant = _G.GetItemInfoInstant or (C_Item and C_Item.GetItemInfoInstant)
+
+local function Pack(...)
+    return { n = select("#", ...), ... }
+end
+
+local function GetItemInfoFields(item)
+    local info = Pack(GetItemInfo(item))
+    if not info[1] then return nil end
+
+    if type(info[5]) == "string" then
+        return {
+            quality = info[3],
+            itemType = info[5],
+            icon = info[9],
+            sellPrice = info[10],
+        }
+    end
+    return {
+        quality = info[3],
+        itemType = info[6],
+        icon = info[10],
+        sellPrice = info[11],
+        classID = info[12],
+        bindType = info[14],
+    }
+end
+
+local function GetItemIcon(itemID)
+    if GetItemInfoInstant then
+        local icon = select(5, GetItemInfoInstant(itemID))
+        if icon then return icon end
+    end
+    local info = GetItemInfoFields(itemID)
+    return info and info.icon
+end
+
+local function SetShown(frame, shown)
+    if frame.SetShown then
+        frame:SetShown(shown)
+    elseif shown then
+        frame:Show()
+    else
+        frame:Hide()
+    end
+end
+
 local function CopyDefaults(src, dst)
     for k, v in pairs(src) do
         if type(v) == "table" then
@@ -51,11 +100,21 @@ local function GetSlotInfo(bag, slot)
     if C_Container and C_Container.GetContainerItemInfo then
         local info = C_Container.GetContainerItemInfo(bag, slot)
         if info then
-            return info.hyperlink, info.stackCount, info.quality, info.hasNoValue
+            local link = info.hyperlink
+            if not (link and link:find("item:", 1, true)) then
+                -- some clients return only the item name here; fall back to a real link / the item ID
+                link = (C_Container.GetContainerItemLink and C_Container.GetContainerItemLink(bag, slot))
+                    or (GetContainerItemLink and GetContainerItemLink(bag, slot))
+                if not (link and link:find("item:", 1, true)) then
+                    link = info.itemID and ("item:" .. info.itemID) or link
+                end
+            end
+            return link, info.stackCount, info.quality, info.hasNoValue
         end
         return nil
     end
     local _, count, _, quality, _, _, link, _, noValue = GetContainerItemInfo(bag, slot)
+    link = link or (GetContainerItemLink and GetContainerItemLink(bag, slot))
     return link, count, quality, noValue
 end
 
@@ -122,19 +181,21 @@ local QUEST_CLASS_ID = 12 -- Enum.ItemClass.Questitem
 local BIND_QUEST = 4
 
 local function IsQuestItem(itemID)
-    local _, _, _, _, _, itemType, _, _, _, _, _, classID, _, bindType = GetItemInfo(itemID)
-    return classID == QUEST_CLASS_ID or itemType == "Quest" or bindType == BIND_QUEST
+    local info = GetItemInfoFields(itemID)
+    return info and (info.classID == QUEST_CLASS_ID or info.itemType == "Quest" or info.bindType == BIND_QUEST) or false
 end
 
 local function Register(itemID, link)
-    link = link or select(2, GetItemInfo(itemID)) or ("item " .. itemID)
+    if not (link and link:find("|H", 1, true)) then
+        link = select(2, GetItemInfo(itemID)) or ("item " .. itemID)
+    end
     if IsQuestItem(itemID) then
         Print(link .. " is a |cffff4040quest item|r and cannot be added to the auto-sell list.")
         return
     end
     db.registered[itemID] = true
-    Print(link .. " added to the auto-sell list.")
-    local label = BlockedLabel(select(3, GetItemInfo(itemID)))
+    local info = GetItemInfoFields(itemID)
+    local label = BlockedLabel(info and info.quality)
     if label then WarnBlocked(link, label) end
 
     local stacks, items = CountStacks(itemID)
@@ -148,7 +209,6 @@ local function ToggleRegister(itemID, link)
     if not itemID then return end
     if db.registered[itemID] then
         db.registered[itemID] = nil
-        Print((link or ("item " .. itemID)) .. " removed from the auto-sell list.")
     else
         Register(itemID, link)
     end
@@ -188,6 +248,28 @@ local QUALITY_NAMES = {
 local SELL_INTERVAL = 0.1-- seconds between sales; selling too fast makes the server drop requests
 local sellTicker
 
+local function NewTicker(interval, callback)
+    if C_Timer and C_Timer.NewTicker then
+        return C_Timer.NewTicker(interval, callback)
+    end
+
+    local ticker = { elapsed = 0, cancelled = false }
+    local frame = CreateFrame("Frame")
+    function ticker:Cancel()
+        self.cancelled = true
+        frame:SetScript("OnUpdate", nil)
+    end
+    frame:SetScript("OnUpdate", function(_, elapsed)
+        if ticker.cancelled then return end
+        ticker.elapsed = ticker.elapsed + elapsed
+        if ticker.elapsed >= interval then
+            ticker.elapsed = ticker.elapsed - interval
+            callback()
+        end
+    end)
+    return ticker
+end
+
 local function StopSelling()
     if sellTicker then
         sellTicker:Cancel()
@@ -210,7 +292,8 @@ local function SellItems()
                 WarnBlocked(link, label)
             end
             if ShouldSell(link, quality, noValue) then
-                local sellPrice = select(11, GetItemInfo(link)) or 0
+                local info = GetItemInfoFields(link)
+                local sellPrice = info and info.sellPrice or 0
                 if sellPrice > 0 then
                     local q, n = quality or 0, stack or 1
                     items[q] = (items[q] or 0) + n
@@ -235,7 +318,7 @@ local function SellItems()
     end
 
     local i = 0
-    sellTicker = C_Timer.NewTicker(SELL_INTERVAL, function()
+    sellTicker = NewTicker(SELL_INTERVAL, function()
         i = i + 1
         local entry = queue[i]
         if not entry then
@@ -255,34 +338,127 @@ end
 -- Bag overlays (small coin on registered items)
 ---------------------------------------------------------------------------
 
-local function UpdateButtonOverlay(button)
-    if not button or not button.GetID then return end
+local function ButtonBagSlot(button)
     local parent = button:GetParent()
-    local bag, slot = parent and parent:GetID(), button:GetID()
+    local bag = (button.GetBagID and button:GetBagID()) or (parent and parent.GetID and parent:GetID())
+    local slot = button.GetID and button:GetID()
+    return bag, slot
+end
+
+local debugClicks = false
+local UpdateButtonOverlay
+local function ToggleFromButton(button)
+    local bag, slot = ButtonBagSlot(button)
+    if debugClicks then Print("toggle: bag=" .. tostring(bag) .. " slot=" .. tostring(slot) .. " link=" .. tostring((bag and slot) and GetSlotInfo(bag, slot))) end
+    if not (bag and slot and bag >= 0 and bag <= 5) then return false end
+    local link = GetSlotInfo(bag, slot)
+    if not link then return false end
+    local id = (C_Container and C_Container.GetContainerItemID and C_Container.GetContainerItemID(bag, slot))
+        or (C_Container and C_Container.GetContainerItemInfo and (C_Container.GetContainerItemInfo(bag, slot) or {}).itemID)
+        or ItemIDFromLink(link)
+    if debugClicks then Print("toggle id=" .. tostring(id) .. " link=" .. tostring(link)) end
+    local ok, err = pcall(ToggleRegister, id, link)
+    if not ok then Print("|cffff4040error:|r " .. tostring(err)) end
+    if UpdateButtonOverlay then UpdateButtonOverlay(button) end
+    return true
+end
+
+-- Alt+Left-click detection that does not depend on the bag UI's click handlers:
+-- on every mouse-down, look at what is under the cursor.
+local function DebugFocus(button)
+    Print("mouse-down: " .. tostring(button) .. " alt=" .. tostring(IsAltKeyDown()))
+    local foci = (GetMouseFoci and GetMouseFoci()) or {}
+    if #foci == 0 and GetMouseFocus then foci[1] = GetMouseFocus() end
+    for i, focus in ipairs(foci) do
+        local f = focus
+        for depth = 1, 4 do
+            if not f then break end
+            local bagID = f.GetBagID and f:GetBagID()
+            Print(string.format("  [%d.%d] name=%s type=%s id=%s bagID=%s", i, depth,
+                tostring(f.GetName and f:GetName()), tostring(f.GetObjectType and f:GetObjectType()),
+                tostring(f.GetID and f:GetID()), tostring(bagID)))
+            f = f.GetParent and f:GetParent()
+        end
+    end
+end
+
+local function OnGlobalMouseDown(button)
+    if debugClicks then DebugFocus(button) end
+    if button ~= "LeftButton" or not IsAltKeyDown()
+        or IsControlKeyDown() or IsShiftKeyDown() then return end
+    local foci = (GetMouseFoci and GetMouseFoci()) or {}
+    if #foci == 0 and GetMouseFocus then foci[1] = GetMouseFocus() end
+    for _, focus in ipairs(foci) do
+        local f = focus
+        for _ = 1, 3 do
+            if not f then break end
+            if f.GetBagID or (f.GetParent and f:GetParent() and f:GetParent().GetID and f:GetID()
+                and f:GetID() > 0 and f:GetParent():GetID() <= 5 and f.GetObjectType
+                and f:GetObjectType() == "Button") then
+                if ToggleFromButton(f) then return end
+            end
+            f = f.GetParent and f:GetParent()
+        end
+    end
+end
+
+local function HookButton() end
+
+function UpdateButtonOverlay(button)
+    if not button or not button.GetID then return end
+    HookButton(button)
+    local bag, slot = ButtonBagSlot(button)
     local show = false
     if bag and slot then
         local link = GetSlotInfo(bag, slot)
         show = IsRegistered(ItemIDFromLink(link))
     end
     if show and not button.asmmCoin then
-        local tex = button:CreateTexture(nil, "OVERLAY")
-        tex:SetTexture("Interface\\Icons\\INV_Misc_Coin_01")
+        local tex = button:CreateTexture(nil, "OVERLAY", nil, 7)
+        tex:SetTexture("Interface/Icons/INV_Misc_Coin_01")
         tex:SetSize(14, 14)
         tex:SetPoint("TOPLEFT", 2, -2)
         button.asmmCoin = tex
     end
-    if button.asmmCoin then button.asmmCoin:SetShown(show) end
+    if button.asmmCoin then SetShown(button.asmmCoin, show) end
+end
+
+local hookedFrames = {}
+
+local function ProcessFrame(frame)
+    if not frame then return end
+    if not hookedFrames[frame] then
+        hookedFrames[frame] = true
+        if frame.HookScript then
+            frame:HookScript("OnShow", function()
+                if C_Timer and C_Timer.After then C_Timer.After(0, RefreshOverlays) else RefreshOverlays() end
+            end)
+        end
+        if frame.UpdateItems then
+            hooksecurefunc(frame, "UpdateItems", function() RefreshOverlays() end)
+        end
+    end
+    if not frame:IsShown() then return end
+    if frame.EnumerateValidItems then
+        for _, button in frame:EnumerateValidItems() do UpdateButtonOverlay(button) end
+    else
+        local name = frame:GetName()
+        for j = 1, (frame.size or 0) do
+            UpdateButtonOverlay(name and _G[name .. "Item" .. j])
+        end
+    end
 end
 
 function RefreshOverlays()
-    for i = 1, (NUM_CONTAINER_FRAMES or 13) do
-        local frame = _G["ContainerFrame" .. i]
-        if frame and frame:IsShown() then
-            for j = 1, (frame.size or 0) do
-                UpdateButtonOverlay(_G["ContainerFrame" .. i .. "Item" .. j])
-            end
-        end
+    if debugClicks then
+        local cb = _G.ContainerFrameCombinedBags
+        Print("refresh: combined=" .. tostring(cb ~= nil) .. " shown=" .. tostring(cb and cb:IsShown())
+            .. " enum=" .. tostring(cb and cb.EnumerateValidItems ~= nil))
     end
+    for i = 1, (NUM_CONTAINER_FRAMES or 13) do
+        ProcessFrame(_G["ContainerFrame" .. i])
+    end
+    ProcessFrame(_G.ContainerFrameCombinedBags)
 end
 
 ---------------------------------------------------------------------------
@@ -321,7 +497,7 @@ function RefreshPanel()
         local id = ids[offset + i]
         btn.itemID = id
         if id then
-            local icon = select(5, GetItemInfoInstant(id))
+            local icon = GetItemIcon(id)
             btn.icon:SetTexture(icon or "Interface\\Icons\\INV_Misc_QuestionMark")
             btn.icon:Show()
         else
@@ -331,24 +507,27 @@ function RefreshPanel()
     panel.count:SetText(#ids .. " registered")
     panel.clear:SetEnabled(#ids > 0)
     panel.pageText:SetText(pages > 1 and ("Page " .. panel.page .. " / " .. pages) or "")
-    panel.prev:SetShown(pages > 1)
-    panel.next:SetShown(pages > 1)
+    SetShown(panel.prev, pages > 1)
+    SetShown(panel.next, pages > 1)
     panel.prev:SetEnabled(panel.page > 1)
     panel.next:SetEnabled(panel.page < pages)
 end
 
 local function CreatePanel()
-    panel = CreateFrame("Frame", "AutoSellMinMaxPanel", UIParent, "BackdropTemplate")
+    panel = CreateFrame("Frame", "AutoSellMinMaxPanel", UIParent,
+        BackdropTemplateMixin and "BackdropTemplate" or nil)
     panel:SetSize(COLS * CELL + 36, 440)
     panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -10, -220)
-    panel:SetClampedToScreen(true)
+    if panel.SetClampedToScreen then panel:SetClampedToScreen(true) end
     panel:SetFrameStrata("DIALOG")
-    panel:SetBackdrop({
-        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-        tile = true, tileSize = 32, edgeSize = 32,
-        insets = { left = 8, right = 8, top = 8, bottom = 8 },
-    })
+    if panel.SetBackdrop then
+        panel:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = { left = 8, right = 8, top = 8, bottom = 8 },
+        })
+    end
     panel:Hide()
     tinsert(UISpecialFrames, "AutoSellMinMaxPanel")
 
@@ -412,7 +591,11 @@ local function CreatePanel()
         b:SetPoint("TOPLEFT", 18 + col * CELL, gridTop - r * CELL)
         b.bg = b:CreateTexture(nil, "BACKGROUND")
         b.bg:SetAllPoints()
-        b.bg:SetColorTexture(0, 0, 0, 0.5)
+        if b.bg.SetColorTexture then
+            b.bg:SetColorTexture(0, 0, 0, 0.5)
+        else
+            b.bg:SetTexture(0, 0, 0, 0.5)
+        end
         b.icon = b:CreateTexture(nil, "ARTWORK")
         b.icon:SetPoint("TOPLEFT", 1, -1)
         b.icon:SetPoint("BOTTOMRIGHT", -1, 1)
@@ -545,7 +728,8 @@ end
 ---------------------------------------------------------------------------
 
 local function CreateBar()
-    bar = CreateFrame("Button", "AutoSellMinMaxMinimapButton", Minimap)
+    -- Keep the button outside the minimap; WoW Forever clips minimap child frames.
+    bar = CreateFrame("Button", "AutoSellMinMaxMinimapButton", UIParent)
     bar:SetSize(31, 31)
     bar:SetFrameStrata("MEDIUM")
     bar:SetFrameLevel(8)
@@ -613,16 +797,8 @@ f:SetScript("OnEvent", function(_, event, arg1)
         CreatePanel()
         CreateInfoPanel()
 
-        -- Alt+Left-click on a bag item toggles registration.
-        hooksecurefunc("HandleModifiedItemClick", function(link)
-            if link and IsAltKeyDown() and not IsControlKeyDown() and not IsShiftKeyDown() then
-                local focus = GetMouseFocus and GetMouseFocus() or (GetMouseFoci and GetMouseFoci()[1])
-                local parent = focus and focus.GetParent and focus:GetParent()
-                if parent and parent.GetName and (parent:GetName() or ""):find("^ContainerFrame%d+$") then
-                    ToggleRegister(ItemIDFromLink(link), link)
-                end
-            end
-        end)
+        -- Alt+Left-click handling is hooked per bag button in RefreshOverlays.
+        RefreshOverlays()
 
         if ContainerFrame_Update then
             hooksecurefunc("ContainerFrame_Update", RefreshOverlays)
@@ -632,9 +808,12 @@ f:SetScript("OnEvent", function(_, event, arg1)
         Print("Registered items are marked with a coin and sold automatically at the next vendor. Click the minimap coin or type /asmm for options.")
 
         f:UnregisterEvent("ADDON_LOADED")
+        pcall(f.RegisterEvent, f, "GLOBAL_MOUSE_DOWN")
         f:RegisterEvent("MERCHANT_SHOW")
         f:RegisterEvent("MERCHANT_CLOSED")
         f:RegisterEvent("BAG_UPDATE_DELAYED")
+    elseif event == "GLOBAL_MOUSE_DOWN" then
+        OnGlobalMouseDown(arg1)
     elseif event == "MERCHANT_SHOW" then
         SellItems()
     elseif event == "MERCHANT_CLOSED" then
@@ -646,6 +825,11 @@ end)
 
 SLASH_AUTOSELLMINMAX1 = "/asmm"
 SLASH_AUTOSELLMINMAX2 = "/autosellminmax"
-SlashCmdList["AUTOSELLMINMAX"] = function()
+SlashCmdList["AUTOSELLMINMAX"] = function(msg)
+    if msg and msg:lower():match("^%s*debug") then
+        debugClicks = not debugClicks
+        Print("click debug " .. (debugClicks and "ON" or "OFF"))
+        return
+    end
     if panel then TogglePanel() end
 end
