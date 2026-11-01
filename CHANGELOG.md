@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2
+
+- Fixed selling stopping partway at the vendor when many items were registered. Items are now sold one after another instead of all at once, and the summary is shown when selling is finished.
+- Selling is cancelled cleanly if you close the vendor window.
+
 ## 1.0.1
 
 - Quest items can no longer be added to the auto-sell list; a message explains why.

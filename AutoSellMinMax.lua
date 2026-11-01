@@ -185,10 +185,22 @@ local QUALITY_NAMES = {
     [5] = "|cffff8000Legendary (orange)|r",
 }
 
+local SELL_INTERVAL = 0.1-- seconds between sales; selling too fast makes the server drop requests
+local sellTicker
+
+local function StopSelling()
+    if sellTicker then
+        sellTicker:Cancel()
+        sellTicker = nil
+    end
+end
+
 local function SellItems()
+    StopSelling()
     local total = 0
     local items, gold = {}, {} -- indexed by quality
     local warned = {}
+    local queue = {}
     for bag = 0, 4 do
         for slot = 1, GetNumSlots(bag) do
             local link, stack, quality, noValue = GetSlotInfo(bag, slot)
@@ -204,20 +216,39 @@ local function SellItems()
                     items[q] = (items[q] or 0) + n
                     gold[q] = (gold[q] or 0) + sellPrice * n
                     total = total + sellPrice * n
-                    UseSlot(bag, slot)
+                    queue[#queue + 1] = { bag, slot, link }
                 end
             end
         end
     end
-    if total == 0 then return end
-    Print("sold items:")
-    for q = 0, 5 do
-        if items[q] then
-            Print(string.format("  %s: %d item%s for %s", QUALITY_NAMES[q], items[q],
-                items[q] == 1 and "" or "s", Money(gold[q])))
+    if #queue == 0 then return end
+
+    local function Report()
+        Print("sold items:")
+        for q = 0, 5 do
+            if items[q] then
+                Print(string.format("  %s: %d item%s for %s", QUALITY_NAMES[q], items[q],
+                    items[q] == 1 and "" or "s", Money(gold[q])))
+            end
         end
+        Print("Total earned: " .. Money(total))
     end
-    Print("Total earned: " .. Money(total))
+
+    local i = 0
+    sellTicker = C_Timer.NewTicker(SELL_INTERVAL, function()
+        i = i + 1
+        local entry = queue[i]
+        if not entry then
+            StopSelling()
+            Report()
+            return
+        end
+        local bag, slot, link = entry[1], entry[2], entry[3]
+        local cur = GetSlotInfo(bag, slot)
+        if cur == link then
+            UseSlot(bag, slot)
+        end
+    end)
 end
 
 ---------------------------------------------------------------------------
@@ -602,9 +633,12 @@ f:SetScript("OnEvent", function(_, event, arg1)
 
         f:UnregisterEvent("ADDON_LOADED")
         f:RegisterEvent("MERCHANT_SHOW")
+        f:RegisterEvent("MERCHANT_CLOSED")
         f:RegisterEvent("BAG_UPDATE_DELAYED")
     elseif event == "MERCHANT_SHOW" then
         SellItems()
+    elseif event == "MERCHANT_CLOSED" then
+        StopSelling()
     elseif event == "BAG_UPDATE_DELAYED" then
         RefreshOverlays()
     end
