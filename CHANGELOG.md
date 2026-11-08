@@ -1,8 +1,16 @@
 # Changelog
 
+## 1.0.6
+
+- Grey (junk) items are now sold with the game's own "Sell All Junk Items" function when the client has it (WoW Forever), instead of one by one. Registered items are still sold one after another. Clients without that function keep the old behaviour.
+
+## 1.0.5
+
+- Added an option "Separate auto-sell list per character" (on by default for new installs). When on, every character has its own list of registered items; turning it on copies the shared list to a character the first time it is used, and the shared list is kept untouched. The setting is shown at startup and in the minimap button tooltip.
+
 ## 1.0.4
 
-- Added an option "Clean up bags after looting and selling" (on by default) that runs the game's bag clean-up (Taschen aufräumen / Sort Bags) after you loot an item and after items were sold at a vendor. It waits until combat ends and combines rapid looting into one clean-up.
+- Added an option "Clean up bags after looting and selling" (on by default) that runs the game's bag clean-up (Taschen aufräumen / Sort Bags) after you loot an item and after items were sold at a vendor. It waits until combat ends and combines rapid looting into one clean-up. The current setting is shown at startup and in the minimap button tooltip.
 
 ## 1.0.3
 

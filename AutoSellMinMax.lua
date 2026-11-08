@@ -5,6 +5,8 @@ local ADDON = "AutoSellMinMax"
 
 local defaults = {
     autoSellGrey = true,
+    perCharacter = true,  -- keep a separate auto-sell list for each character
+    characters = {},      -- ["Name-Realm"] = { registered = {} }
     sortBags = true, -- clean up ("Taschen aufräumen") after looting and selling
     block = { [2] = true, [3] = true, [4] = true, [5] = true }, -- green, blue, epic, legendary
     registered = {},                                            -- [itemID] = true
@@ -26,6 +28,10 @@ local slotButtons = {}
 -- Helpers
 ---------------------------------------------------------------------------
 
+local function OnOff(v)
+    return v and "|cff00ff00ON|r" or "|cffff0000OFF|r"
+end
+
 local function Print(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99" .. ADDON .. "|r: " .. msg)
 end
@@ -33,6 +39,24 @@ end
 -- Newer clients moved these into C_Item and removed the globals.
 local GetItemInfo = _G.GetItemInfo or (C_Item and C_Item.GetItemInfo)
 local GetItemInfoInstant = _G.GetItemInfoInstant or (C_Item and C_Item.GetItemInfoInstant)
+
+local function CharKey()
+    return (UnitName("player") or "?") .. "-" .. (GetRealmName and GetRealmName() or "?")
+end
+
+-- The active auto-sell list: the account-wide one, or this character's own list.
+-- A character's list starts as a copy of the account-wide list the first time it is used.
+local function Registered()
+    if not db.perCharacter then return db.registered end
+    local key = CharKey()
+    local c = db.characters[key]
+    if not c then
+        c = { registered = {} }
+        for id in pairs(db.registered) do c.registered[id] = true end
+        db.characters[key] = c
+    end
+    return c.registered
+end
 
 local function Pack(...)
     return { n = select("#", ...), ... }
@@ -142,7 +166,7 @@ end
 local RefreshOverlays, RefreshPanel
 
 local function IsRegistered(itemID)
-    return itemID and db.registered[itemID] or false
+    return itemID and Registered()[itemID] or false
 end
 
 local QUALITY_LABELS = {
@@ -194,7 +218,7 @@ local function Register(itemID, link)
         Print(link .. " is a |cffff4040quest item|r and cannot be added to the auto-sell list.")
         return
     end
-    db.registered[itemID] = true
+    Registered()[itemID] = true
     local info = GetItemInfoFields(itemID)
     local label = BlockedLabel(info and info.quality)
     if label then WarnBlocked(link, label) end
@@ -208,8 +232,9 @@ end
 
 local function ToggleRegister(itemID, link)
     if not itemID then return end
-    if db.registered[itemID] then
-        db.registered[itemID] = nil
+    local reg = Registered()
+    if reg[itemID] then
+        reg[itemID] = nil
     else
         Register(itemID, link)
     end
@@ -309,8 +334,16 @@ local function StopSelling()
     end
 end
 
+-- The game's own "Sell All Junk Items" (newer clients); nil on clients without it.
+local function GetSellAllJunk()
+    local m = C_MerchantFrame
+    if m and type(m.SellAllJunkItems) == "function" then return m.SellAllJunkItems end
+end
+
 local function SellItems()
     StopSelling()
+    local sellJunk = db.autoSellGrey and GetSellAllJunk()
+    local junkCount = 0
     local total = 0
     local items, gold = {}, {} -- indexed by quality
     local warned = {}
@@ -331,12 +364,16 @@ local function SellItems()
                     items[q] = (items[q] or 0) + n
                     gold[q] = (gold[q] or 0) + sellPrice * n
                     total = total + sellPrice * n
-                    queue[#queue + 1] = { bag, slot, link }
+                    if sellJunk and quality == 0 then
+                        junkCount = junkCount + 1 -- sold in one go by "Sell All Junk Items"
+                    else
+                        queue[#queue + 1] = { bag, slot, link }
+                    end
                 end
             end
         end
     end
-    if #queue == 0 then return end
+    if #queue == 0 and junkCount == 0 then return end
 
     local function Report()
         Print("sold items:")
@@ -351,6 +388,24 @@ local function SellItems()
     local function Finish()
         Report()
         RequestSort(0.5)
+    end
+
+    if junkCount > 0 then
+        if not pcall(sellJunk) then
+            -- fall back to selling the grey items one by one
+            for bag = 0, 4 do
+                for slot = 1, GetNumSlots(bag) do
+                    local link, _, quality, noValue = GetSlotInfo(bag, slot)
+                    if link and quality == 0 and not noValue and not IsQuestItem(ItemIDFromLink(link)) then
+                        queue[#queue + 1] = { bag, slot, link }
+                    end
+                end
+            end
+        end
+    end
+    if #queue == 0 then
+        Finish()
+        return
     end
 
     local i = 0
@@ -516,7 +571,7 @@ end
 
 local function RegisteredIDs()
     local ids = {}
-    for id in pairs(db.registered) do ids[#ids + 1] = id end
+    for id in pairs(Registered()) do ids[#ids + 1] = id end
     table.sort(ids)
     return ids
 end
@@ -552,7 +607,7 @@ end
 local function CreatePanel()
     panel = CreateFrame("Frame", "AutoSellMinMaxPanel", UIParent,
         BackdropTemplateMixin and "BackdropTemplate" or nil)
-    panel:SetSize(COLS * CELL + 36, 466)
+    panel:SetSize(COLS * CELL + 36, 492)
     panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -10, -220)
     if panel.SetClampedToScreen then panel:SetClampedToScreen(true) end
     panel:SetFrameStrata("DIALOG")
@@ -580,6 +635,16 @@ local function CreatePanel()
         function() return db.autoSellGrey end,
         function(v) db.autoSellGrey = v end)
     y = y - 26
+    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Separate auto-sell list per character", y,
+        function() return db.perCharacter end,
+        function(v)
+            db.perCharacter = v
+            panel.page = 1
+            RefreshOverlays()
+            RefreshPanel()
+            Print("auto-sell list: " .. (v and "|cffffd100this character only|r" or "|cffffd100shared by all characters|r") .. ".")
+        end)
+    y = y - 26
     panel.checks[#panel.checks + 1] = CreateCheck(panel, "Clean up bags after looting and selling", y,
         function() return db.sortBags end,
         function(v) db.sortBags = v end)
@@ -604,7 +669,7 @@ local function CreatePanel()
         button1 = YES,
         button2 = NO,
         OnAccept = function()
-            wipe(db.registered)
+            wipe(Registered())
             panel.page = 1
             Print("auto-sell list cleared.")
             RefreshOverlays()
@@ -644,7 +709,7 @@ local function CreatePanel()
         b:SetScript("OnClick", function(self)
             local cursorType, id = GetCursorInfo()
             if cursorType == "item" then
-                if not db.registered[id] then Register(id) end
+                if not Registered()[id] then Register(id) end
                 ClearCursor()
                 RefreshOverlays(); RefreshPanel()
             elseif self.itemID then
@@ -814,7 +879,9 @@ local function CreateBar()
     bar:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:AddLine("AutoSellMinMax")
-        GameTooltip:AddLine("Auto sell grey: " .. (db.autoSellGrey and "|cff00ff00ON|r" or "|cffff0000OFF|r"), 1, 1, 1)
+        GameTooltip:AddLine("Auto sell grey: " .. OnOff(db.autoSellGrey), 1, 1, 1)
+        GameTooltip:AddLine("Auto-sell list: " .. (db.perCharacter and "this character" or "all characters"), 1, 1, 1)
+        GameTooltip:AddLine("Clean up bags after looting/selling: " .. OnOff(db.sortBags), 1, 1, 1)
         GameTooltip:AddLine("Click for options. Drag to move around the minimap.", 0.7, 0.7, 0.7)
         GameTooltip:Show()
     end)
@@ -845,6 +912,8 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
         end
 
         Print("loaded. |cffffd100Alt+Left-click|r any item in your bags to register it for auto-selling (click again to unregister).")
+        Print("Auto-sell list: " .. (db.perCharacter and "|cffffd100this character only|r" or "|cffffd100shared by all characters|r") .. ".")
+        Print("Auto clean up bags after looting and selling: " .. OnOff(db.sortBags) .. " (change it in the options).")
         Print("Registered items are marked with a coin and sold automatically at the next vendor. Click the minimap coin or type /asmm for options.")
 
         f:UnregisterEvent("ADDON_LOADED")
