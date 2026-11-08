@@ -5,6 +5,7 @@ local ADDON = "AutoSellMinMax"
 
 local defaults = {
     autoSellGrey = true,
+    sortBags = true, -- clean up ("Taschen aufräumen") after looting and selling
     block = { [2] = true, [3] = true, [4] = true, [5] = true }, -- green, blue, epic, legendary
     registered = {},                                            -- [itemID] = true
     minimapAngle = 200, -- degrees around the minimap
@@ -270,6 +271,37 @@ local function NewTicker(interval, callback)
     return ticker
 end
 
+---------------------------------------------------------------------------
+-- Bag clean-up ("Taschen aufräumen" / Sort Bags)
+---------------------------------------------------------------------------
+
+local sortPending = false
+local sortTimer
+
+local function SortBagsNow()
+    if InCombatLockdown and InCombatLockdown() then
+        sortPending = true -- retried when combat ends
+        return
+    end
+    local fn = (C_Container and C_Container.SortBags) or _G.SortBags
+    if fn then pcall(fn) end
+end
+
+-- Debounced: many loot messages in a row (e.g. AoE looting) lead to one clean-up.
+local function RequestSort(delay)
+    if not (db and db.sortBags) then return end
+    if sortTimer then sortTimer:Cancel() end
+    if C_Timer and C_Timer.NewTimer then
+        sortTimer = C_Timer.NewTimer(delay or 0.5, function()
+            sortTimer = nil
+            if sellTicker then return end -- the end of selling triggers its own clean-up
+            SortBagsNow()
+        end)
+    else
+        SortBagsNow()
+    end
+end
+
 local function StopSelling()
     if sellTicker then
         sellTicker:Cancel()
@@ -316,6 +348,10 @@ local function SellItems()
         end
         Print("Total earned: " .. Money(total))
     end
+    local function Finish()
+        Report()
+        RequestSort(0.5)
+    end
 
     local i = 0
     sellTicker = NewTicker(SELL_INTERVAL, function()
@@ -323,7 +359,7 @@ local function SellItems()
         local entry = queue[i]
         if not entry then
             StopSelling()
-            Report()
+            Finish()
             return
         end
         local bag, slot, link = entry[1], entry[2], entry[3]
@@ -516,7 +552,7 @@ end
 local function CreatePanel()
     panel = CreateFrame("Frame", "AutoSellMinMaxPanel", UIParent,
         BackdropTemplateMixin and "BackdropTemplate" or nil)
-    panel:SetSize(COLS * CELL + 36, 440)
+    panel:SetSize(COLS * CELL + 36, 466)
     panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -10, -220)
     if panel.SetClampedToScreen then panel:SetClampedToScreen(true) end
     panel:SetFrameStrata("DIALOG")
@@ -543,6 +579,10 @@ local function CreatePanel()
     panel.checks[1] = CreateCheck(panel, "Auto sell all grey items", y,
         function() return db.autoSellGrey end,
         function(v) db.autoSellGrey = v end)
+    y = y - 26
+    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Clean up bags after looting and selling", y,
+        function() return db.sortBags end,
+        function(v) db.sortBags = v end)
     y = y - 30
     for _, row in ipairs(QUALITY_ROWS) do
         local q = row.q
@@ -787,7 +827,7 @@ end
 
 local f = CreateFrame("Frame")
 f:RegisterEvent("ADDON_LOADED")
-f:SetScript("OnEvent", function(_, event, arg1)
+f:SetScript("OnEvent", function(_, event, arg1, ...)
     if event == "ADDON_LOADED" and arg1 == ADDON then
         AutoSellMinMaxDB = AutoSellMinMaxDB or {}
         db = AutoSellMinMaxDB
@@ -809,11 +849,22 @@ f:SetScript("OnEvent", function(_, event, arg1)
 
         f:UnregisterEvent("ADDON_LOADED")
         pcall(f.RegisterEvent, f, "GLOBAL_MOUSE_DOWN")
+        f:RegisterEvent("CHAT_MSG_LOOT")
+        f:RegisterEvent("PLAYER_REGEN_ENABLED")
         f:RegisterEvent("MERCHANT_SHOW")
         f:RegisterEvent("MERCHANT_CLOSED")
         f:RegisterEvent("BAG_UPDATE_DELAYED")
     elseif event == "GLOBAL_MOUSE_DOWN" then
         OnGlobalMouseDown(arg1)
+    elseif event == "CHAT_MSG_LOOT" then
+        -- Only our own loot (arg12 = GUID of the looter).
+        local guid = select(11, ...) -- arg12 overall; arg1 is already split off
+        if guid == UnitGUID("player") then RequestSort(0.5) end
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        if sortPending then
+            sortPending = false
+            RequestSort(0.5)
+        end
     elseif event == "MERCHANT_SHOW" then
         SellItems()
     elseif event == "MERCHANT_CLOSED" then

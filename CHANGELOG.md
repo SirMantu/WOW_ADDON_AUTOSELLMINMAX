@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.4
+
+- Added an option "Clean up bags after looting and selling" (on by default) that runs the game's bag clean-up (Taschen aufräumen / Sort Bags) after you loot an item and after items were sold at a vendor. It waits until combat ends and combines rapid looting into one clean-up.
+
 ## 1.0.3
 
 - Added WoW Forever support while retaining Classic Era compatibility.
