@@ -8,6 +8,8 @@ local defaults = {
     perCharacter = true,  -- keep a separate auto-sell list for each character
     characters = {},      -- ["Name-Realm"] = { registered = {} }
     sortBags = true, -- clean up ("Taschen aufräumen") after looting and selling
+    autoRepair = true,       -- repair all gear at vendors that can repair
+    repairGuildFunds = false, -- pay repairs from the guild bank first, when allowed
     block = { [2] = true, [3] = true, [4] = true, [5] = true }, -- green, blue, epic, legendary
     registered = {},                                            -- [itemID] = true
     minimapAngle = 200, -- degrees around the minimap
@@ -340,8 +342,58 @@ local function GetSellAllJunk()
     if m and type(m.SellAllJunkItems) == "function" then return m.SellAllJunkItems end
 end
 
-local function SellItems()
+---------------------------------------------------------------------------
+-- Repairing
+---------------------------------------------------------------------------
+
+local merchantOpen = false
+
+-- Can the guild bank pay `cost` for this player right now?
+local function GuildCanPay(cost)
+    if not (IsInGuild and IsInGuild()) then return false end
+    if not (CanGuildBankRepair and CanGuildBankRepair()) then return false end
+    local limit = GetGuildBankWithdrawMoney and GetGuildBankWithdrawMoney()
+    local bank = GetGuildBankMoney and GetGuildBankMoney()
+    -- a limit of -1 means "unlimited" (guild master)
+    if limit and limit ~= -1 and limit < cost then return false end
+    if bank and bank > 0 and bank < cost then return false end
+    return true
+end
+
+local function RepairItems()
+    if not (db.autoRepair and merchantOpen) then return end
+    if not (CanMerchantRepair and CanMerchantRepair() and GetRepairAllCost and RepairAllItems) then return end
+    local cost, canRepair = GetRepairAllCost()
+    if not (canRepair and cost and cost > 0) then return end
+
+    if db.repairGuildFunds and GuildCanPay(cost) then
+        if pcall(RepairAllItems, true) then
+            Print("Repaired all items for " .. Money(cost) .. " |cff40ff40(guild bank)|r.")
+            return
+        end
+    end
+
+    if GetMoney() < cost then
+        Print(string.format("|cffff4040Not enough gold to repair:|r costs %s, you have %s.",
+            Money(cost), Money(GetMoney())))
+        return
+    end
+    RepairAllItems()
+    Print("Repaired all items for " .. Money(cost) .. ".")
+end
+
+local function After(delay, fn)
+    if C_Timer and C_Timer.After then C_Timer.After(delay, fn) else fn() end
+end
+
+-- onDone runs once selling is finished (immediately if there was nothing to sell).
+local function SellItems(onDone)
     StopSelling()
+    local function Done(sold)
+        if not onDone then return end
+        -- after a sale give the server a moment so the earned gold counts for repairs
+        if sold then After(0.5, onDone) else onDone() end
+    end
     local sellJunk = db.autoSellGrey and GetSellAllJunk()
     local junkCount = 0
     local total = 0
@@ -373,7 +425,10 @@ local function SellItems()
             end
         end
     end
-    if #queue == 0 and junkCount == 0 then return end
+    if #queue == 0 and junkCount == 0 then
+        Done(false)
+        return
+    end
 
     local function Report()
         Print("sold items:")
@@ -388,6 +443,7 @@ local function SellItems()
     local function Finish()
         Report()
         RequestSort(0.5)
+        Done(true)
     end
 
     if junkCount > 0 then
@@ -607,7 +663,7 @@ end
 local function CreatePanel()
     panel = CreateFrame("Frame", "AutoSellMinMaxPanel", UIParent,
         BackdropTemplateMixin and "BackdropTemplate" or nil)
-    panel:SetSize(COLS * CELL + 36, 492)
+    panel:SetSize(COLS * CELL + 36, 544)
     panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -10, -220)
     if panel.SetClampedToScreen then panel:SetClampedToScreen(true) end
     panel:SetFrameStrata("DIALOG")
@@ -648,6 +704,14 @@ local function CreatePanel()
     panel.checks[#panel.checks + 1] = CreateCheck(panel, "Clean up bags after looting and selling", y,
         function() return db.sortBags end,
         function(v) db.sortBags = v end)
+    y = y - 26
+    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Auto repair all items at vendors", y,
+        function() return db.autoRepair end,
+        function(v) db.autoRepair = v end)
+    y = y - 26
+    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Use guild funds for repairs first", y,
+        function() return db.repairGuildFunds end,
+        function(v) db.repairGuildFunds = v end)
     y = y - 30
     for _, row in ipairs(QUALITY_ROWS) do
         local q = row.q
@@ -882,6 +946,8 @@ local function CreateBar()
         GameTooltip:AddLine("Auto sell grey: " .. OnOff(db.autoSellGrey), 1, 1, 1)
         GameTooltip:AddLine("Auto-sell list: " .. (db.perCharacter and "this character" or "all characters"), 1, 1, 1)
         GameTooltip:AddLine("Clean up bags after looting/selling: " .. OnOff(db.sortBags), 1, 1, 1)
+        GameTooltip:AddLine("Auto repair: " .. OnOff(db.autoRepair)
+            .. (db.autoRepair and db.repairGuildFunds and " (guild funds first)" or ""), 1, 1, 1)
         GameTooltip:AddLine("Click for options. Drag to move around the minimap.", 0.7, 0.7, 0.7)
         GameTooltip:Show()
     end)
@@ -914,6 +980,8 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
         Print("loaded. |cffffd100Alt+Left-click|r any item in your bags to register it for auto-selling (click again to unregister).")
         Print("Auto-sell list: " .. (db.perCharacter and "|cffffd100this character only|r" or "|cffffd100shared by all characters|r") .. ".")
         Print("Auto clean up bags after looting and selling: " .. OnOff(db.sortBags) .. " (change it in the options).")
+        Print("Auto repair at vendors: " .. OnOff(db.autoRepair)
+            .. (db.autoRepair and db.repairGuildFunds and " (guild funds first)" or "") .. ".")
         Print("Registered items are marked with a coin and sold automatically at the next vendor. Click the minimap coin or type /asmm for options.")
 
         f:UnregisterEvent("ADDON_LOADED")
@@ -935,8 +1003,10 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
             RequestSort(0.5)
         end
     elseif event == "MERCHANT_SHOW" then
-        SellItems()
+        merchantOpen = true
+        SellItems(RepairItems) -- repair after selling, so the earned gold can pay for it
     elseif event == "MERCHANT_CLOSED" then
+        merchantOpen = false
         StopSelling()
     elseif event == "BAG_UPDATE_DELAYED" then
         RefreshOverlays()

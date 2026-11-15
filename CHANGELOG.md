@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.7
+
+- Added an option "Auto repair all items at vendors" (on by default). When you open a vendor that can repair, all your gear is repaired automatically. Repairs happen after selling, so the gold from the sale can pay for them. The chat shows what the repair cost, or warns you if you do not have enough gold.
+- Added an option "Use guild funds for repairs first" (off by default). When on, and your guild rank allows it and the guild bank can cover the cost, repairs are paid from the guild bank. Otherwise your own gold is used.
+- Both settings are shown at startup and in the minimap button tooltip.
+
 ## 1.0.6
 
 - Grey (junk) items are now sold with the game's own "Sell All Junk Items" function when the client has it (WoW Forever), instead of one by one. Registered items are still sold one after another. Clients without that function keep the old behaviour.
