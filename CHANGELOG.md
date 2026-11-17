@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1
+
+- Fixed auto-buy buying more than the amount you set. Items that vendors sell in packs (for example water in packs of 5) were always rounded up: with 2 water and a target of 20, four packs were bought and you ended up with 22. By default, only whole packs that still fit under the target are bought now (2 + 15 = 17 in this example).
+- New setting "Items sold in packs" in the auto-buy column with three modes:
+  - **Round down** (default): never above your amount, at most one pack less (3 water, target 20 → 18).
+  - **Round up**: never below your amount, at most one pack more (3 water, target 20 → 23).
+  - **Exact amount** (not recommended): rounds up, then sells the surplus back to the vendor (3 water, target 20 → 23, then 3 are sold back → 20). Vendors pay much less than they charge, so this costs gold on every visit. Choosing it asks for confirmation, and the chat shows how much gold the rounding cost. It also sells surplus you looted, for items this vendor sells.
+- Items sold one by one are always bought to the exact amount, whatever the setting.
+- Tip: for items sold in packs, set the amount to a multiple of the pack size to hit it exactly when your bags are empty.
+- Auto-buy now checks your bags again before every single purchase, so it stops as soon as the target is reached.
+
 ## 1.1.0
 
 - **New: auto-buy list.** Keep items such as water, food or reagents stocked. Set an amount per item. At a vendor that sells the item, AutoSellMinMax buys what is missing until you carry that amount.

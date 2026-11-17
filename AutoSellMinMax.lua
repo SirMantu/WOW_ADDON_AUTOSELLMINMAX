@@ -7,6 +7,9 @@ local ADDON = "AutoSellMinMax"
 local defaults = {
     autoSellGrey = true,
     autoBuy = true,       -- top up the auto-buy list at vendors
+    -- items sold in packs: "down" = never above the amount, "up" = never below it,
+    -- "exact" = round up, then sell the surplus back (costs gold, not recommended)
+    buyRounding = "down",
     perCharacter = true,  -- keep separate auto-sell / auto-buy lists for each character
     characters = {},      -- ["Name-Realm"] = { registered = {}, buy = {} }
     buy = {},             -- [itemID] = number of items to keep in the bags
@@ -599,6 +602,153 @@ local function MerchantItems()
     return byID
 end
 
+local function SplitSlot(bag, slot, n)
+    if C_Container and C_Container.SplitContainerItem then
+        C_Container.SplitContainerItem(bag, slot, n)
+    elseif SplitContainerItem then
+        SplitContainerItem(bag, slot, n)
+    end
+end
+
+local function PickupSlot(bag, slot)
+    if C_Container and C_Container.PickupContainerItem then
+        C_Container.PickupContainerItem(bag, slot)
+    else
+        PickupContainerItem(bag, slot)
+    end
+end
+
+-- An empty slot in a normal bag (not a quiver, soul bag, ...).
+local function FindEmptySlot()
+    for bag = 0, 4 do
+        local _, bagType
+        if C_Container and C_Container.GetContainerNumFreeSlots then
+            _, bagType = C_Container.GetContainerNumFreeSlots(bag)
+        elseif GetContainerNumFreeSlots then
+            _, bagType = GetContainerNumFreeSlots(bag)
+        end
+        if bagType == nil or bagType == 0 then
+            for slot = 1, GetNumSlots(bag) do
+                if not GetSlotInfo(bag, slot) then return bag, slot end
+            end
+        end
+    end
+end
+
+-- "exact" mode: sell back everything above the amount you set.
+-- items = { [itemID] = { target, index (merchant index), unitPrice } }
+local function TrimSurplus(items)
+    if not merchantOpen then return end
+    local actions, report = {}, {}
+    local lost = 0
+    for id, e in pairs(items) do
+        local surplus = (GetItemCount(id) or 0) - e.target
+        local info = GetItemInfoFields(id)
+        local sellPrice = info and info.sellPrice or 0
+        if surplus > 0 and sellPrice > 0 then
+            report[#report + 1] = { id = id, count = surplus, gold = sellPrice * surplus }
+            lost = lost + math.max(0, e.unitPrice - sellPrice) * surplus
+            -- smallest stacks first, so leftover partial stacks go before a full stack is split
+            local slots = {}
+            for bag = 0, 4 do
+                for slot = 1, GetNumSlots(bag) do
+                    local link, count = GetSlotInfo(bag, slot)
+                    if link and ItemIDFromLink(link) == id then
+                        slots[#slots + 1] = { bag = bag, slot = slot, count = count or 1 }
+                    end
+                end
+            end
+            table.sort(slots, function(a, b) return a.count < b.count end)
+            for _, s in ipairs(slots) do
+                if surplus <= 0 then break end
+                local n = math.min(surplus, s.count)
+                actions[#actions + 1] = { id = id, bag = s.bag, slot = s.slot, n = n, count = s.count, index = e.index }
+                surplus = surplus - n
+            end
+        elseif surplus > 0 then
+            Print(ItemLink(id) .. " cannot be sold to vendors, so the surplus is kept.")
+        end
+    end
+    if #actions == 0 then
+        RequestSort(0.5)
+        return
+    end
+
+    local function Done()
+        StopBuying()
+        Print("|cffff8000exact amount:|r sold back the surplus:")
+        for _, r in ipairs(report) do
+            Print(string.format("  %dx %s for %s", r.count, ItemLink(r.id), Money(r.gold)))
+        end
+        if lost > 0 then
+            Print("|cffff4040Lost to rounding:|r " .. Money(math.floor(lost + 0.5))
+                .. " (bought price minus sell price). Switch to round down or up in the options to avoid this.")
+        end
+        -- tell the player if anything is still above the amount
+        After(1.5, function()
+            for id, e in pairs(items) do
+                local have = GetItemCount(id) or 0
+                if have > e.target then
+                    Print(string.format("|cffff4040Could not sell all surplus|r of %s: you have %d, your amount is %d.",
+                        ItemLink(id), have, e.target))
+                end
+            end
+        end)
+        RequestSort(0.5)
+    end
+
+    local MAX_TRIES = 10 -- ticks to wait for a locked slot (items are locked briefly after a purchase)
+    local i, tries = 1, 0
+    local pending -- surplus that was split into an empty slot and still has to be sold
+    buyTicker = NewTicker(SELL_INTERVAL * 3, function()
+        -- step 2 of a split: sell the slot the surplus was put into
+        if pending then
+            local link, count = GetSlotInfo(pending.bag, pending.slot)
+            if link and ItemIDFromLink(link) == pending.id and (count or 1) == pending.n then
+                UseSlot(pending.bag, pending.slot)
+                pending = nil
+            else
+                pending.tries = pending.tries + 1
+                if pending.tries > MAX_TRIES then pending = nil end
+            end
+            return
+        end
+
+        local a = actions[i]
+        if not a then
+            Done()
+            return
+        end
+        local function Next() i, tries = i + 1, 0 end
+        local function Retry()
+            tries = tries + 1
+            if tries > MAX_TRIES then Next() end
+        end
+
+        local link, count = GetSlotInfo(a.bag, a.slot)
+        count = count or 1
+        if not link or ItemIDFromLink(link) ~= a.id or count < a.n then return Retry() end
+        if a.n >= count then
+            UseSlot(a.bag, a.slot) -- sell the whole stack
+            return Next()
+        end
+
+        -- split off the surplus: into an empty bag slot, then sell that slot (same way as normal selling)
+        if CursorHasItem and CursorHasItem() then return Retry() end -- do not disturb what the player holds
+        SplitSlot(a.bag, a.slot, a.n)
+        if not (CursorHasItem and CursorHasItem()) then return Retry() end -- slot still locked
+        local eb, es = FindEmptySlot()
+        if eb then
+            PickupSlot(eb, es)
+            pending = { bag = eb, slot = es, n = a.n, id = a.id, tries = 0 }
+        else
+            PickupMerchantItem(a.index) -- no empty slot: drop it on the vendor instead
+            if CursorHasItem and CursorHasItem() then ClearCursor() end
+        end
+        Next()
+    end)
+end
+
 local function BuyItems(budget)
     StopBuying()
     if not (db.autoBuy and merchantOpen and GetItemCount) then return end
@@ -609,6 +759,9 @@ local function BuyItems(budget)
     local free = GetFreeSlots()
     local queue, bought, short, total = {}, {}, {}, 0
     local bagsFull = false
+    local mode = db.buyRounding
+    local roundUp = mode == "up" or mode == "exact"
+    local exact = {} -- items to trim back to the exact amount afterwards ("exact" mode)
 
     local ids = {}
     for id in pairs(list) do ids[#ids + 1] = id end
@@ -618,6 +771,10 @@ local function BuyItems(budget)
         local index = sold[id]
         local have = GetItemCount(id) or 0
         local need = list[id] - have
+        if index and mode == "exact" then
+            local price, bundle = MerchantItemInfo(index)
+            exact[id] = { target = list[id], index = index, unitPrice = price / bundle }
+        end
         if index and need > 0 then
             local price, bundle, available = MerchantItemInfo(index)
             local info = GetItemInfoFields(id)
@@ -630,9 +787,11 @@ local function BuyItems(budget)
                 free = free - slots
                 room = room + slots * maxStack
             end
+            -- items sold in packs (e.g. 5 water) cannot hit every amount exactly:
+            -- round down (default, never above the amount) or up (never below it)
             local purchases
             if need <= room then
-                purchases = math.ceil(need / bundle)
+                purchases = roundUp and math.ceil(need / bundle) or math.floor(need / bundle)
             else
                 purchases = math.floor(room / bundle)
                 bagsFull = true
@@ -657,12 +816,12 @@ local function BuyItems(budget)
                     local left = count
                     while left > 0 do
                         local n = math.min(left, perCall)
-                        queue[#queue + 1] = { index, id, n }
+                        queue[#queue + 1] = { index, id, n, list[id] }
                         left = left - n
                     end
                 else
                     -- items sold in bundles: buy one bundle per click
-                    for _ = 1, purchases do queue[#queue + 1] = { index, id } end
+                    for _ = 1, purchases do queue[#queue + 1] = { index, id, nil, list[id], bundle } end
                 end
             end
         end
@@ -675,13 +834,19 @@ local function BuyItems(budget)
                 Print(string.format("  %dx %s for %s", b.count, ItemLink(b.id), Money(b.cost)))
             end
             Print("Total spent: " .. Money(total))
-            RequestSort(0.5)
         end
         for _, link in ipairs(short) do
             Print("|cffff4040Not enough gold|r to buy all of " .. link .. ".")
         end
         if bagsFull then
             Print("|cffff4040Bags full:|r could not buy everything on the auto-buy list.")
+        end
+        if next(exact) then
+            -- wait until the bought items have arrived in the bags, then sell the surplus
+            -- (bag clean-up runs after that, so it does not move items while we sell)
+            After(1, function() TrimSurplus(exact) end)
+        elseif #bought > 0 then
+            RequestSort(0.5)
         end
     end
 
@@ -699,10 +864,16 @@ local function BuyItems(budget)
             Finish()
             return
         end
-        local index, id, n = entry[1], entry[2], entry[3]
+        local index, id, n, target, bundle = entry[1], entry[2], entry[3], entry[4], entry[5]
         -- the vendor list can change (limited stock); only buy if the slot still holds our item
-        if ItemIDFromLink(GetMerchantItemLink(index)) == id then
-            if n then BuyMerchantItem(index, n) else BuyMerchantItem(index) end
+        if ItemIDFromLink(GetMerchantItemLink(index)) ~= id then return end
+        -- check the bags again before every purchase, so we stop once the target is reached
+        local have = GetItemCount(id) or 0
+        if n then
+            n = math.min(n, target - have)
+            if n > 0 then BuyMerchantItem(index, n) end
+        elseif (roundUp and have < target) or have + bundle <= target then
+            BuyMerchantItem(index)
         end
     end)
 end
@@ -1167,14 +1338,63 @@ local function CreatePanel()
         function() return db.autoBuy end,
         function(v) db.autoBuy = v end,
         COL2_X - 4, -42)
+    -- rounding for items sold in packs: three check boxes that act like radio buttons
+    local packs = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    packs:SetPoint("TOPLEFT", COL2_X + 2, -74)
+    packs:SetText("Items sold in packs (e.g. 5 water):")
+
+    local ROUNDING_MSG = {
+        down = "|cffffd100round down|r (never above your amount, up to one pack less)",
+        up = "|cffffd100round up|r (never below your amount, up to one pack more)",
+        exact = "|cffff8000exact amount|r (round up, then sell the surplus back; |cffff4040costs gold, not recommended|r)",
+    }
+    local function SetRounding(mode)
+        db.buyRounding = mode
+        Print("auto-buy packs: " .. ROUNDING_MSG[mode] .. ".")
+        RefreshPanel()
+    end
+    StaticPopupDialogs["AUTOSELLMINMAX_EXACT"] = {
+        text = "|cffff4040Not recommended!|r\n\nExact amount buys whole packs and sells the surplus back to the vendor. "
+            .. "Vendors pay much less than they charge, so you lose gold on every visit.\n\n"
+            .. "It also sells items above your amount that you looted.\n\nUse exact amount anyway?",
+        button1 = YES,
+        button2 = NO,
+        OnAccept = function() SetRounding("exact") end,
+        OnCancel = function() RefreshPanel() end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+        showAlert = true,
+    }
+    local roundingRows = {
+        { mode = "down", label = "Round down (never above the amount)", y = -86 },
+        { mode = "up", label = "Round up (never below the amount)", y = -110 },
+        { mode = "exact", label = "Exact amount |cffff4040(not recommended)|r", y = -134 },
+    }
+    for _, row in ipairs(roundingRows) do
+        local mode = row.mode
+        Check(row.label,
+            function() return db.buyRounding == mode end,
+            function(v)
+                if not v or db.buyRounding == mode then
+                    RefreshPanel() -- one mode is always selected
+                elseif mode == "exact" then
+                    RefreshPanel() -- wait for the confirmation
+                    StaticPopup_Show("AUTOSELLMINMAX_EXACT")
+                else
+                    SetRounding(mode)
+                end
+            end,
+            COL2_X + 4, row.y)
+    end
 
     local about = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    about:SetPoint("TOPLEFT", COL2_X + 2, -76)
+    about:SetPoint("TOPLEFT", COL2_X + 2, -170)
     about:SetWidth(GRID_W - 4)
     about:SetJustifyH("LEFT")
     about:SetText("Keeps the amount you set of each item in your bags, e.g. water or food. "
-        .. "At a vendor that sells the item, the missing amount is bought after selling and repairing.\n\n"
-        .. "Purchases stop when you run out of gold or bag space, and the chat shows what was bought.")
+        .. "At a vendor that sells it, the missing amount is bought after selling and repairing. "
+        .. "Purchases stop when you run out of gold or bag space.")
 
     buyGrid = CreateItemGrid({
         x = COL2_X, y = y, title = "Items to auto buy", countWord = "items",
