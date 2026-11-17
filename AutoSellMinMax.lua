@@ -1,12 +1,15 @@
 -- AutoSellMinMax
--- Auto-sells grey items (and items you register) when a vendor window opens.
+-- Auto-sells grey items (and items you register) when a vendor window opens,
+-- and buys items from your auto-buy list until you carry the amount you set.
 
 local ADDON = "AutoSellMinMax"
 
 local defaults = {
     autoSellGrey = true,
-    perCharacter = true,  -- keep a separate auto-sell list for each character
-    characters = {},      -- ["Name-Realm"] = { registered = {} }
+    autoBuy = true,       -- top up the auto-buy list at vendors
+    perCharacter = true,  -- keep separate auto-sell / auto-buy lists for each character
+    characters = {},      -- ["Name-Realm"] = { registered = {}, buy = {} }
+    buy = {},             -- [itemID] = number of items to keep in the bags
     sortBags = true, -- clean up ("Taschen aufräumen") after looting and selling
     autoRepair = true,       -- repair all gear at vendors that can repair
     repairGuildFunds = false, -- pay repairs from the guild bank first, when allowed
@@ -14,6 +17,8 @@ local defaults = {
     registered = {},                                            -- [itemID] = true
     minimapAngle = 200, -- degrees around the minimap
 }
+
+local BUY_ICON = "Interface\\GossipFrame\\VendorGossipIcon" -- marks auto-buy items in the bags
 
 local QUALITY_ROWS = {
     { q = 2, label = "Block selling |cff1eff00Uncommon (green)|r items" },
@@ -24,7 +29,6 @@ local QUALITY_ROWS = {
 
 local db
 local bar, panel
-local slotButtons = {}
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -46,18 +50,36 @@ local function CharKey()
     return (UnitName("player") or "?") .. "-" .. (GetRealmName and GetRealmName() or "?")
 end
 
--- The active auto-sell list: the account-wide one, or this character's own list.
--- A character's list starts as a copy of the account-wide list the first time it is used.
-local function Registered()
-    if not db.perCharacter then return db.registered end
+-- This character's own lists. Each list starts as a copy of the account-wide
+-- list the first time it is used.
+local function CharData()
     local key = CharKey()
     local c = db.characters[key]
     if not c then
-        c = { registered = {} }
-        for id in pairs(db.registered) do c.registered[id] = true end
+        c = {}
         db.characters[key] = c
     end
-    return c.registered
+    if not c.registered then
+        c.registered = {}
+        for id in pairs(db.registered) do c.registered[id] = true end
+    end
+    if not c.buy then
+        c.buy = {}
+        for id, n in pairs(db.buy) do c.buy[id] = n end
+    end
+    return c
+end
+
+-- The active auto-sell list: the account-wide one, or this character's own list.
+local function Registered()
+    if not db.perCharacter then return db.registered end
+    return CharData().registered
+end
+
+-- The active auto-buy list ([itemID] = amount to keep).
+local function BuyList()
+    if not db.perCharacter then return db.buy end
+    return CharData().buy
 end
 
 local function Pack(...)
@@ -72,6 +94,7 @@ local function GetItemInfoFields(item)
         return {
             quality = info[3],
             itemType = info[5],
+            maxStack = info[7],
             icon = info[9],
             sellPrice = info[10],
         }
@@ -79,6 +102,7 @@ local function GetItemInfoFields(item)
     return {
         quality = info[3],
         itemType = info[6],
+        maxStack = info[8],
         icon = info[10],
         sellPrice = info[11],
         classID = info[12],
@@ -220,6 +244,10 @@ local function Register(itemID, link)
         Print(link .. " is a |cffff4040quest item|r and cannot be added to the auto-sell list.")
         return
     end
+    if BuyList()[itemID] then
+        BuyList()[itemID] = nil
+        Print(link .. " was removed from the auto-buy list, because it is now on the auto-sell list.")
+    end
     Registered()[itemID] = true
     local info = GetItemInfoFields(itemID)
     local label = BlockedLabel(info and info.quality)
@@ -244,6 +272,42 @@ local function ToggleRegister(itemID, link)
     RefreshPanel()
 end
 
+local function ItemLink(itemID, link)
+    if link and link:find("|H", 1, true) then return link end
+    return select(2, GetItemInfo(itemID)) or ("item " .. itemID)
+end
+
+-- New auto-buy entries start with one full stack (1 for items that do not stack).
+local function DefaultBuyAmount(itemID)
+    local info = GetItemInfoFields(itemID)
+    return math.max(1, info and info.maxStack or 1)
+end
+
+local function RegisterBuy(itemID, link)
+    link = ItemLink(itemID, link)
+    if Registered()[itemID] then
+        Registered()[itemID] = nil
+        Print(link .. " was removed from the auto-sell list, because it is now on the auto-buy list.")
+    end
+    local n = DefaultBuyAmount(itemID)
+    BuyList()[itemID] = n
+    Print(string.format("%s added to the auto-buy list: keeping |cffffd100%d|r in your bags. Change the amount in the options (minimap coin or /asmm).",
+        link, n))
+end
+
+local function ToggleBuy(itemID, link)
+    if not itemID then return end
+    local list = BuyList()
+    if list[itemID] then
+        list[itemID] = nil
+        Print(ItemLink(itemID, link) .. " removed from the auto-buy list.")
+    else
+        RegisterBuy(itemID, link)
+    end
+    RefreshOverlays()
+    RefreshPanel()
+end
+
 ---------------------------------------------------------------------------
 -- Selling
 ---------------------------------------------------------------------------
@@ -252,6 +316,7 @@ local function ShouldSell(link, quality, hasNoValue)
     if not link or hasNoValue then return false end
     local itemID = ItemIDFromLink(link)
     if IsQuestItem(itemID) then return false end -- never sell quest items
+    if itemID and BuyList()[itemID] then return false end -- never sell what we keep stocked
     local registered = IsRegistered(itemID)
 
     if quality == 0 then
@@ -360,26 +425,28 @@ local function GuildCanPay(cost)
     return true
 end
 
+-- Returns how much of the player's own gold was spent.
 local function RepairItems()
-    if not (db.autoRepair and merchantOpen) then return end
-    if not (CanMerchantRepair and CanMerchantRepair() and GetRepairAllCost and RepairAllItems) then return end
+    if not (db.autoRepair and merchantOpen) then return 0 end
+    if not (CanMerchantRepair and CanMerchantRepair() and GetRepairAllCost and RepairAllItems) then return 0 end
     local cost, canRepair = GetRepairAllCost()
-    if not (canRepair and cost and cost > 0) then return end
+    if not (canRepair and cost and cost > 0) then return 0 end
 
     if db.repairGuildFunds and GuildCanPay(cost) then
         if pcall(RepairAllItems, true) then
             Print("Repaired all items for " .. Money(cost) .. " |cff40ff40(guild bank)|r.")
-            return
+            return 0
         end
     end
 
     if GetMoney() < cost then
         Print(string.format("|cffff4040Not enough gold to repair:|r costs %s, you have %s.",
             Money(cost), Money(GetMoney())))
-        return
+        return 0
     end
     RepairAllItems()
     Print("Repaired all items for " .. Money(cost) .. ".")
+    return cost
 end
 
 local function After(delay, fn)
@@ -482,6 +549,165 @@ local function SellItems(onDone)
 end
 
 ---------------------------------------------------------------------------
+-- Buying (keep items from the auto-buy list stocked)
+---------------------------------------------------------------------------
+
+local GetItemCount = _G.GetItemCount or (C_Item and C_Item.GetItemCount)
+local BUY_INTERVAL = 0.2 -- seconds between purchases
+local buyTicker
+
+local function StopBuying()
+    if buyTicker then
+        buyTicker:Cancel()
+        buyTicker = nil
+    end
+end
+
+-- Free slots in normal bags (special bags such as quivers or soul bags are not counted).
+local function GetFreeSlots()
+    local free = 0
+    for bag = 0, 4 do
+        local n, bagType
+        if C_Container and C_Container.GetContainerNumFreeSlots then
+            n, bagType = C_Container.GetContainerNumFreeSlots(bag)
+        elseif GetContainerNumFreeSlots then
+            n, bagType = GetContainerNumFreeSlots(bag)
+        end
+        if n and (bagType == nil or bagType == 0) then free = free + n end
+    end
+    return free
+end
+
+-- price per purchase, items per purchase, purchases left at this vendor (-1 = unlimited)
+local function MerchantItemInfo(index)
+    if C_MerchantFrame and type(C_MerchantFrame.GetItemInfo) == "function" then
+        local i = C_MerchantFrame.GetItemInfo(index)
+        if i then return i.price or 0, math.max(1, i.stackCount or 1), i.numAvailable or -1 end
+    end
+    local _, _, price, quantity, numAvailable = GetMerchantItemInfo(index)
+    return price or 0, math.max(1, quantity or 1), numAvailable or -1
+end
+
+-- [itemID] = merchant index, for everything this vendor sells for gold.
+local function MerchantItems()
+    local byID = {}
+    for index = 1, (GetMerchantNumItems and GetMerchantNumItems() or 0) do
+        local id = ItemIDFromLink(GetMerchantItemLink(index))
+        local tokens = GetMerchantItemCostInfo and GetMerchantItemCostInfo(index) or 0
+        if id and not byID[id] and tokens == 0 then byID[id] = index end
+    end
+    return byID
+end
+
+local function BuyItems(budget)
+    StopBuying()
+    if not (db.autoBuy and merchantOpen and GetItemCount) then return end
+    local list = BuyList()
+    if not next(list) then return end
+
+    local sold = MerchantItems()
+    local free = GetFreeSlots()
+    local queue, bought, short, total = {}, {}, {}, 0
+    local bagsFull = false
+
+    local ids = {}
+    for id in pairs(list) do ids[#ids + 1] = id end
+    table.sort(ids)
+
+    for _, id in ipairs(ids) do
+        local index = sold[id]
+        local have = GetItemCount(id) or 0
+        local need = list[id] - have
+        if index and need > 0 then
+            local price, bundle, available = MerchantItemInfo(index)
+            local info = GetItemInfoFields(id)
+            local maxStack = math.max(1, info and info.maxStack or 1)
+
+            -- room: the rest of the last partial stack, then whole free bag slots
+            local room = (have % maxStack == 0) and 0 or (maxStack - have % maxStack)
+            if need > room then
+                local slots = math.min(free, math.ceil((need - room) / maxStack))
+                free = free - slots
+                room = room + slots * maxStack
+            end
+            local purchases
+            if need <= room then
+                purchases = math.ceil(need / bundle)
+            else
+                purchases = math.floor(room / bundle)
+                bagsFull = true
+            end
+            if available >= 0 then purchases = math.min(purchases, available) end
+            if price > 0 then
+                local affordable = math.floor(math.max(0, budget) / price)
+                if affordable < purchases then
+                    purchases = affordable
+                    short[#short + 1] = ItemLink(id)
+                end
+            end
+
+            if purchases > 0 then
+                local count = purchases * bundle
+                budget = budget - purchases * price
+                total = total + purchases * price
+                bought[#bought + 1] = { id = id, count = count, cost = purchases * price }
+                if bundle == 1 then
+                    -- items sold one by one: buy up to a full stack per click
+                    local perCall = math.max(1, (GetMerchantItemMaxStack and GetMerchantItemMaxStack(index)) or maxStack)
+                    local left = count
+                    while left > 0 do
+                        local n = math.min(left, perCall)
+                        queue[#queue + 1] = { index, id, n }
+                        left = left - n
+                    end
+                else
+                    -- items sold in bundles: buy one bundle per click
+                    for _ = 1, purchases do queue[#queue + 1] = { index, id } end
+                end
+            end
+        end
+    end
+
+    local function Finish()
+        if #bought > 0 then
+            Print("bought items:")
+            for _, b in ipairs(bought) do
+                Print(string.format("  %dx %s for %s", b.count, ItemLink(b.id), Money(b.cost)))
+            end
+            Print("Total spent: " .. Money(total))
+            RequestSort(0.5)
+        end
+        for _, link in ipairs(short) do
+            Print("|cffff4040Not enough gold|r to buy all of " .. link .. ".")
+        end
+        if bagsFull then
+            Print("|cffff4040Bags full:|r could not buy everything on the auto-buy list.")
+        end
+    end
+
+    if #queue == 0 then
+        Finish()
+        return
+    end
+
+    local i = 0
+    buyTicker = NewTicker(BUY_INTERVAL, function()
+        i = i + 1
+        local entry = queue[i]
+        if not entry then
+            StopBuying()
+            Finish()
+            return
+        end
+        local index, id, n = entry[1], entry[2], entry[3]
+        -- the vendor list can change (limited stock); only buy if the slot still holds our item
+        if ItemIDFromLink(GetMerchantItemLink(index)) == id then
+            if n then BuyMerchantItem(index, n) else BuyMerchantItem(index) end
+        end
+    end)
+end
+
+---------------------------------------------------------------------------
 -- Bag overlays (small coin on registered items)
 ---------------------------------------------------------------------------
 
@@ -494,7 +720,7 @@ end
 
 local debugClicks = false
 local UpdateButtonOverlay
-local function ToggleFromButton(button)
+local function ToggleFromButton(button, buy)
     local bag, slot = ButtonBagSlot(button)
     if debugClicks then Print("toggle: bag=" .. tostring(bag) .. " slot=" .. tostring(slot) .. " link=" .. tostring((bag and slot) and GetSlotInfo(bag, slot))) end
     if not (bag and slot and bag >= 0 and bag <= 5) then return false end
@@ -504,14 +730,14 @@ local function ToggleFromButton(button)
         or (C_Container and C_Container.GetContainerItemInfo and (C_Container.GetContainerItemInfo(bag, slot) or {}).itemID)
         or ItemIDFromLink(link)
     if debugClicks then Print("toggle id=" .. tostring(id) .. " link=" .. tostring(link)) end
-    local ok, err = pcall(ToggleRegister, id, link)
+    local ok, err = pcall(buy and ToggleBuy or ToggleRegister, id, link)
     if not ok then Print("|cffff4040error:|r " .. tostring(err)) end
     if UpdateButtonOverlay then UpdateButtonOverlay(button) end
     return true
 end
 
--- Alt+Left-click detection that does not depend on the bag UI's click handlers:
--- on every mouse-down, look at what is under the cursor.
+-- Alt+Left-click (auto-sell) and Ctrl+Alt+Left-click (auto-buy) detection that does not
+-- depend on the bag UI's click handlers: on every mouse-down, look at what is under the cursor.
 local function DebugFocus(button)
     Print("mouse-down: " .. tostring(button) .. " alt=" .. tostring(IsAltKeyDown()))
     local foci = (GetMouseFoci and GetMouseFoci()) or {}
@@ -531,8 +757,8 @@ end
 
 local function OnGlobalMouseDown(button)
     if debugClicks then DebugFocus(button) end
-    if button ~= "LeftButton" or not IsAltKeyDown()
-        or IsControlKeyDown() or IsShiftKeyDown() then return end
+    if button ~= "LeftButton" or not IsAltKeyDown() or IsShiftKeyDown() then return end
+    local buy = IsControlKeyDown() -- Ctrl+Alt (AltGr on many keyboards) = auto-buy list
     local foci = (GetMouseFoci and GetMouseFoci()) or {}
     if #foci == 0 and GetMouseFocus then foci[1] = GetMouseFocus() end
     for _, focus in ipairs(foci) do
@@ -542,7 +768,7 @@ local function OnGlobalMouseDown(button)
             if f.GetBagID or (f.GetParent and f:GetParent() and f:GetParent().GetID and f:GetID()
                 and f:GetID() > 0 and f:GetParent():GetID() <= 5 and f.GetObjectType
                 and f:GetObjectType() == "Button") then
-                if ToggleFromButton(f) then return end
+                if ToggleFromButton(f, buy) then return end
             end
             f = f.GetParent and f:GetParent()
         end
@@ -555,10 +781,11 @@ function UpdateButtonOverlay(button)
     if not button or not button.GetID then return end
     HookButton(button)
     local bag, slot = ButtonBagSlot(button)
-    local show = false
+    local show, buy = false, false
     if bag and slot then
-        local link = GetSlotInfo(bag, slot)
-        show = IsRegistered(ItemIDFromLink(link))
+        local id = ItemIDFromLink((GetSlotInfo(bag, slot)))
+        show = IsRegistered(id)
+        buy = id and BuyList()[id] and true or false
     end
     if show and not button.asmmCoin then
         local tex = button:CreateTexture(nil, "OVERLAY", nil, 7)
@@ -568,6 +795,14 @@ function UpdateButtonOverlay(button)
         button.asmmCoin = tex
     end
     if button.asmmCoin then SetShown(button.asmmCoin, show) end
+    if buy and not button.asmmBuy then
+        local tex = button:CreateTexture(nil, "OVERLAY", nil, 7)
+        tex:SetTexture(BUY_ICON)
+        tex:SetSize(14, 14)
+        tex:SetPoint("TOPRIGHT", -2, -2)
+        button.asmmBuy = tex
+    end
+    if button.asmmBuy then SetShown(button.asmmBuy, buy) end
 end
 
 local hookedFrames = {}
@@ -613,10 +848,15 @@ end
 ---------------------------------------------------------------------------
 
 local COLS, ROWS, CELL = 8, 4, 36
+local GRID_W = COLS * CELL
+local COL1_X = 18                    -- auto-sell column
+local COL2_X = COL1_X + GRID_W + 30  -- auto-buy column
 
-local function CreateCheck(parent, label, y, get, set)
+local sellGrid, buyGrid
+
+local function CreateCheck(parent, label, x, y, get, set)
     local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    cb:SetPoint("TOPLEFT", 14, y)
+    cb:SetPoint("TOPLEFT", x, y)
     cb.text = cb:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     cb.text:SetPoint("LEFT", cb, "RIGHT", 2, 0)
     cb.text:SetText(label)
@@ -625,46 +865,180 @@ local function CreateCheck(parent, label, y, get, set)
     return cb
 end
 
-local function RegisteredIDs()
+local function SortedIDs(list)
     local ids = {}
-    for id in pairs(Registered()) do ids[#ids + 1] = id end
+    for id in pairs(list) do ids[#ids + 1] = id end
     table.sort(ids)
     return ids
+end
+
+-- Re-draw a grid button's tooltip if the mouse is still over it.
+local function UpdateTooltip(btn)
+    if GameTooltip:IsOwned(btn) then btn:GetScript("OnEnter")(btn) end
+end
+
+-- A paged grid of item icons with a header, a "Clear all" button and a pager.
+-- opts: x, y, title, countWord, popup, list(), onDrop(cursorType, a), onClick(btn, mouseButton),
+--       tooltip(btn), label(id, value) optional, onWheel(btn, delta) optional
+local function CreateItemGrid(opts)
+    local g = { page = 1, buttons = {} }
+
+    local hdr = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    hdr:SetPoint("TOPLEFT", opts.x + 2, opts.y - 8)
+    hdr:SetText(opts.title)
+
+    g.count = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    g.count:SetPoint("LEFT", hdr, "RIGHT", 8, 0)
+
+    g.clear = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    g.clear:SetSize(80, 20)
+    g.clear:SetText("Clear all")
+    g.clear:SetPoint("TOPLEFT", opts.x + GRID_W - 82, opts.y - 4)
+    g.clear:SetScript("OnClick", function()
+        local n = #SortedIDs(opts.list())
+        if n > 0 then StaticPopup_Show(opts.popup, n) end
+    end)
+
+    local gridTop = opts.y - 28
+    for i = 1, COLS * ROWS do
+        local col, r = (i - 1) % COLS, math.floor((i - 1) / COLS)
+        local b = CreateFrame("Button", nil, panel)
+        b:SetSize(CELL - 2, CELL - 2)
+        b:SetPoint("TOPLEFT", opts.x + col * CELL, gridTop - r * CELL)
+        b.bg = b:CreateTexture(nil, "BACKGROUND")
+        b.bg:SetAllPoints()
+        if b.bg.SetColorTexture then
+            b.bg:SetColorTexture(0, 0, 0, 0.5)
+        else
+            b.bg:SetTexture(0, 0, 0, 0.5)
+        end
+        b.icon = b:CreateTexture(nil, "ARTWORK")
+        b.icon:SetPoint("TOPLEFT", 1, -1)
+        b.icon:SetPoint("BOTTOMRIGHT", -1, 1)
+        b.label = b:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+        b.label:SetPoint("BOTTOMRIGHT", -2, 2)
+        b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+        b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        b:SetScript("OnClick", function(self, mouseButton)
+            local cursorType, a = GetCursorInfo()
+            if cursorType then
+                opts.onDrop(cursorType, a)
+                ClearCursor()
+                RefreshOverlays(); RefreshPanel()
+            elseif self.itemID then
+                opts.onClick(self, mouseButton or "LeftButton")
+            end
+        end)
+        b:SetScript("OnReceiveDrag", function(self) self:GetScript("OnClick")(self, "LeftButton") end)
+        if opts.onWheel then
+            b:EnableMouseWheel(true)
+            b:SetScript("OnMouseWheel", function(self, delta)
+                if self.itemID then opts.onWheel(self, delta) end
+            end)
+        end
+        b:SetScript("OnEnter", function(self)
+            if not self.itemID then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetItemByID(self.itemID)
+            opts.tooltip(self)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", GameTooltip_Hide)
+        g.buttons[i] = b
+    end
+
+    local pagerY = gridTop - ROWS * CELL - 2
+    g.prev = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    g.prev:SetSize(28, 22)
+    g.prev:SetText("<")
+    g.prev:SetPoint("TOPLEFT", opts.x, pagerY)
+    g.prev:SetScript("OnClick", function() g.page = g.page - 1; RefreshPanel() end)
+    g.next = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    g.next:SetSize(28, 22)
+    g.next:SetText(">")
+    g.next:SetPoint("TOPLEFT", opts.x + GRID_W - 30, pagerY)
+    g.next:SetScript("OnClick", function() g.page = g.page + 1; RefreshPanel() end)
+    g.pageText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    g.pageText:SetPoint("TOP", panel, "TOPLEFT", opts.x + GRID_W / 2, pagerY - 5)
+
+    function g:Refresh()
+        local list = opts.list()
+        local ids = SortedIDs(list)
+        local perPage = #self.buttons
+        local pages = math.max(1, math.ceil(#ids / perPage))
+        self.page = math.min(math.max(self.page or 1, 1), pages)
+        local offset = (self.page - 1) * perPage
+        for i, btn in ipairs(self.buttons) do
+            local id = ids[offset + i]
+            btn.itemID = id
+            if id then
+                btn.icon:SetTexture(GetItemIcon(id) or "Interface\\Icons\\INV_Misc_QuestionMark")
+                btn.icon:Show()
+            else
+                btn.icon:Hide()
+            end
+            btn.label:SetText(id and opts.label and opts.label(id, list[id]) or "")
+        end
+        self.count:SetText(#ids .. " " .. opts.countWord)
+        self.clear:SetEnabled(#ids > 0)
+        self.pageText:SetText(pages > 1 and ("Page " .. self.page .. " / " .. pages) or "")
+        SetShown(self.prev, pages > 1)
+        SetShown(self.next, pages > 1)
+        self.prev:SetEnabled(self.page > 1)
+        self.next:SetEnabled(self.page < pages)
+    end
+
+    return g
+end
+
+---------------------------------------------------------------------------
+-- Auto-buy amount dialog
+---------------------------------------------------------------------------
+
+local function PopupEditBox(dialog)
+    return dialog.editBox or dialog.EditBox
+        or (dialog.GetName and dialog:GetName() and _G[dialog:GetName() .. "EditBox"])
+end
+
+local function ApplyBuyAmount(dialog)
+    local eb = PopupEditBox(dialog)
+    local id = dialog.data
+    local n = eb and tonumber(eb:GetText())
+    if not (id and n) then return end
+    n = math.floor(n)
+    if n <= 0 then
+        BuyList()[id] = nil
+        Print(ItemLink(id) .. " removed from the auto-buy list.")
+    else
+        BuyList()[id] = n
+    end
+    RefreshOverlays()
+    RefreshPanel()
+end
+
+local function AskBuyAmount(id)
+    local dialog = StaticPopup_Show("AUTOSELLMINMAX_BUYAMOUNT", ItemLink(id))
+    if not dialog then return end
+    dialog.data = id
+    local eb = PopupEditBox(dialog)
+    if eb then
+        eb:SetText(tostring(BuyList()[id] or 1))
+        eb:HighlightText()
+    end
 end
 
 function RefreshPanel()
     if not panel then return end
     for _, cb in ipairs(panel.checks) do cb:Refresh() end
-    local ids = RegisteredIDs()
-    local perPage = #slotButtons
-    local pages = math.max(1, math.ceil(#ids / perPage))
-    panel.page = math.min(math.max(panel.page or 1, 1), pages)
-    local offset = (panel.page - 1) * perPage
-    for i, btn in ipairs(slotButtons) do
-        local id = ids[offset + i]
-        btn.itemID = id
-        if id then
-            local icon = GetItemIcon(id)
-            btn.icon:SetTexture(icon or "Interface\\Icons\\INV_Misc_QuestionMark")
-            btn.icon:Show()
-        else
-            btn.icon:Hide()
-        end
-    end
-    panel.count:SetText(#ids .. " registered")
-    panel.clear:SetEnabled(#ids > 0)
-    panel.pageText:SetText(pages > 1 and ("Page " .. panel.page .. " / " .. pages) or "")
-    SetShown(panel.prev, pages > 1)
-    SetShown(panel.next, pages > 1)
-    panel.prev:SetEnabled(panel.page > 1)
-    panel.next:SetEnabled(panel.page < pages)
+    sellGrid:Refresh()
+    buyGrid:Refresh()
 end
 
 local function CreatePanel()
     panel = CreateFrame("Frame", "AutoSellMinMaxPanel", UIParent,
         BackdropTemplateMixin and "BackdropTemplate" or nil)
-    panel:SetSize(COLS * CELL + 36, 544)
-    panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -10, -220)
+    panel:SetSize(COL2_X + GRID_W + 18, 560)
+    panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -10, -200)
     if panel.SetClampedToScreen then panel:SetClampedToScreen(true) end
     panel:SetFrameStrata("DIALOG")
     if panel.SetBackdrop then
@@ -685,48 +1059,46 @@ local function CreatePanel()
     local close = CreateFrame("Button", nil, panel, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -4, -4)
 
+    -- left column: general and auto-sell options
+    local x = COL1_X - 4
     panel.checks = {}
     local y = -42
-    panel.checks[1] = CreateCheck(panel, "Auto sell all grey items", y,
+    local function Check(label, get, set, cx, cy)
+        panel.checks[#panel.checks + 1] = CreateCheck(panel, label, cx or x, cy or y, get, set)
+    end
+    Check("Auto sell all grey items",
         function() return db.autoSellGrey end,
         function(v) db.autoSellGrey = v end)
     y = y - 26
-    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Separate auto-sell list per character", y,
+    Check("Separate sell/buy lists per character",
         function() return db.perCharacter end,
         function(v)
             db.perCharacter = v
-            panel.page = 1
+            sellGrid.page, buyGrid.page = 1, 1
             RefreshOverlays()
             RefreshPanel()
-            Print("auto-sell list: " .. (v and "|cffffd100this character only|r" or "|cffffd100shared by all characters|r") .. ".")
+            Print("auto-sell and auto-buy lists: " .. (v and "|cffffd100this character only|r" or "|cffffd100shared by all characters|r") .. ".")
         end)
     y = y - 26
-    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Clean up bags after looting and selling", y,
+    Check("Clean up bags after looting and selling",
         function() return db.sortBags end,
         function(v) db.sortBags = v end)
     y = y - 26
-    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Auto repair all items at vendors", y,
+    Check("Auto repair all items at vendors",
         function() return db.autoRepair end,
         function(v) db.autoRepair = v end)
     y = y - 26
-    panel.checks[#panel.checks + 1] = CreateCheck(panel, "Use guild funds for repairs first", y,
+    Check("Use guild funds for repairs first",
         function() return db.repairGuildFunds end,
         function(v) db.repairGuildFunds = v end)
     y = y - 30
     for _, row in ipairs(QUALITY_ROWS) do
         local q = row.q
-        panel.checks[#panel.checks + 1] = CreateCheck(panel, row.label, y,
+        Check(row.label,
             function() return db.block[q] end,
             function(v) db.block[q] = v end)
         y = y - 26
     end
-
-    local hdr = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    hdr:SetPoint("TOPLEFT", 20, y - 8)
-    hdr:SetText("Items to auto sell")
-
-    panel.count = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    panel.count:SetPoint("LEFT", hdr, "RIGHT", 8, 0)
 
     StaticPopupDialogs["AUTOSELLMINMAX_CLEAR"] = {
         text = "Remove all %d items from the AutoSellMinMax auto-sell list?",
@@ -734,7 +1106,7 @@ local function CreatePanel()
         button2 = NO,
         OnAccept = function()
             wipe(Registered())
-            panel.page = 1
+            sellGrid.page = 1
             Print("auto-sell list cleared.")
             RefreshOverlays()
             RefreshPanel()
@@ -743,74 +1115,117 @@ local function CreatePanel()
         whileDead = true,
         hideOnEscape = true,
     }
-    panel.clear = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    panel.clear:SetSize(80, 20)
-    panel.clear:SetText("Clear all")
-    panel.clear:SetPoint("TOPRIGHT", -20, y - 4)
-    panel.clear:SetScript("OnClick", function()
-        local n = #RegisteredIDs()
-        if n > 0 then StaticPopup_Show("AUTOSELLMINMAX_CLEAR", n) end
-    end)
+    StaticPopupDialogs["AUTOSELLMINMAX_CLEARBUY"] = {
+        text = "Remove all %d items from the AutoSellMinMax auto-buy list?",
+        button1 = YES,
+        button2 = NO,
+        OnAccept = function()
+            wipe(BuyList())
+            buyGrid.page = 1
+            Print("auto-buy list cleared.")
+            RefreshOverlays()
+            RefreshPanel()
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+    StaticPopupDialogs["AUTOSELLMINMAX_BUYAMOUNT"] = {
+        text = "How many %s should be kept in your bags?\n(0 removes it from the auto-buy list)",
+        button1 = OKAY,
+        button2 = CANCEL,
+        hasEditBox = true,
+        OnAccept = function(self) ApplyBuyAmount(self) end,
+        EditBoxOnEnterPressed = function(self)
+            local dialog = self:GetParent()
+            ApplyBuyAmount(dialog)
+            dialog:Hide()
+        end,
+        EditBoxOnEscapePressed = function(self) self:GetParent():Hide() end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
 
-    local gridTop = y - 28
-    for i = 1, COLS * ROWS do
-        local col, r = (i - 1) % COLS, math.floor((i - 1) / COLS)
-        local b = CreateFrame("Button", nil, panel)
-        b:SetSize(CELL - 2, CELL - 2)
-        b:SetPoint("TOPLEFT", 18 + col * CELL, gridTop - r * CELL)
-        b.bg = b:CreateTexture(nil, "BACKGROUND")
-        b.bg:SetAllPoints()
-        if b.bg.SetColorTexture then
-            b.bg:SetColorTexture(0, 0, 0, 0.5)
-        else
-            b.bg:SetTexture(0, 0, 0, 0.5)
-        end
-        b.icon = b:CreateTexture(nil, "ARTWORK")
-        b.icon:SetPoint("TOPLEFT", 1, -1)
-        b.icon:SetPoint("BOTTOMRIGHT", -1, 1)
-        b:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
-        b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-        b:SetScript("OnClick", function(self)
-            local cursorType, id = GetCursorInfo()
-            if cursorType == "item" then
-                if not Registered()[id] then Register(id) end
-                ClearCursor()
-                RefreshOverlays(); RefreshPanel()
-            elseif self.itemID then
-                ToggleRegister(self.itemID, select(2, GetItemInfo(self.itemID)))
-            end
-        end)
-        b:SetScript("OnReceiveDrag", function(self) self:GetScript("OnClick")(self) end)
-        b:SetScript("OnEnter", function(self)
-            if not self.itemID then return end
-            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-            GameTooltip:SetItemByID(self.itemID)
+    sellGrid = CreateItemGrid({
+        x = COL1_X, y = y, title = "Items to auto sell", countWord = "registered",
+        popup = "AUTOSELLMINMAX_CLEAR",
+        list = Registered,
+        onDrop = function(cursorType, id)
+            if cursorType == "item" and id and not Registered()[id] then Register(id) end
+        end,
+        onClick = function(btn)
+            ToggleRegister(btn.itemID, select(2, GetItemInfo(btn.itemID)))
+        end,
+        tooltip = function()
             GameTooltip:AddLine("|cffff4040Click to remove from auto-sell list|r")
-            GameTooltip:Show()
-        end)
-        b:SetScript("OnLeave", GameTooltip_Hide)
-        slotButtons[i] = b
-    end
+        end,
+    })
 
-    local pagerY = gridTop - ROWS * CELL - 2
-    panel.prev = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    panel.prev:SetSize(28, 22)
-    panel.prev:SetText("<")
-    panel.prev:SetPoint("TOPLEFT", 18, pagerY)
-    panel.prev:SetScript("OnClick", function() panel.page = panel.page - 1; RefreshPanel() end)
-    panel.next = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    panel.next:SetSize(28, 22)
-    panel.next:SetText(">")
-    panel.next:SetPoint("TOPLEFT", 18 + COLS * CELL - 30, pagerY)
-    panel.next:SetScript("OnClick", function() panel.page = panel.page + 1; RefreshPanel() end)
-    panel.pageText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    panel.pageText:SetPoint("TOP", panel, "TOPLEFT", 18 + COLS * CELL / 2, pagerY - 5)
+    -- right column: auto-buy
+    Check("Auto buy items at vendors",
+        function() return db.autoBuy end,
+        function(v) db.autoBuy = v end,
+        COL2_X - 4, -42)
+
+    local about = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    about:SetPoint("TOPLEFT", COL2_X + 2, -76)
+    about:SetWidth(GRID_W - 4)
+    about:SetJustifyH("LEFT")
+    about:SetText("Keeps the amount you set of each item in your bags, e.g. water or food. "
+        .. "At a vendor that sells the item, the missing amount is bought after selling and repairing.\n\n"
+        .. "Purchases stop when you run out of gold or bag space, and the chat shows what was bought.")
+
+    buyGrid = CreateItemGrid({
+        x = COL2_X, y = y, title = "Items to auto buy", countWord = "items",
+        popup = "AUTOSELLMINMAX_CLEARBUY",
+        list = BuyList,
+        label = function(_, n) return n end,
+        onDrop = function(cursorType, a)
+            local id
+            if cursorType == "item" then
+                id = a
+            elseif cursorType == "merchant" then
+                id = ItemIDFromLink(GetMerchantItemLink(a))
+            end
+            if id and not BuyList()[id] then RegisterBuy(id) end
+        end,
+        onClick = function(btn, mouseButton)
+            if mouseButton == "RightButton" then
+                ToggleBuy(btn.itemID)
+                GameTooltip_Hide()
+            else
+                AskBuyAmount(btn.itemID)
+            end
+        end,
+        onWheel = function(btn, delta)
+            local id = btn.itemID
+            local step = IsShiftKeyDown() and DefaultBuyAmount(id) or 1
+            BuyList()[id] = math.max(1, (BuyList()[id] or 1) + delta * step)
+            RefreshPanel()
+            UpdateTooltip(btn)
+        end,
+        tooltip = function(btn)
+            local want = BuyList()[btn.itemID] or 0
+            local have = GetItemCount and GetItemCount(btn.itemID) or 0
+            GameTooltip:AddLine(string.format("Keep |cffffd100%d|r in your bags (you have %d)", want, have), 1, 1, 1)
+            GameTooltip:AddLine("Left-click: set amount", 0.7, 0.7, 0.7)
+            GameTooltip:AddLine("Mouse wheel: +/- 1 (Shift: one stack)", 0.7, 0.7, 0.7)
+            GameTooltip:AddLine("|cffff4040Right-click: remove from auto-buy list|r")
+        end,
+    })
 
     local help = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    help:SetPoint("BOTTOMLEFT", 20, 16)
-    help:SetWidth(COLS * CELL - 4)
+    help:SetPoint("BOTTOMLEFT", COL1_X + 2, 16)
+    help:SetWidth(GRID_W - 4)
     help:SetJustifyH("LEFT")
     help:SetText("|cffffd100Alt+Left-click|r an item in your bags to add or remove it. You can also drag an item onto the grid. Registered items show a coin in your bags.")
+
+    local buyHelp = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    buyHelp:SetPoint("BOTTOMLEFT", COL2_X + 2, 16)
+    buyHelp:SetWidth(GRID_W - 4)
+    buyHelp:SetJustifyH("LEFT")
+    buyHelp:SetText("|cffffd100Ctrl+Alt+Left-click|r an item in your bags to add or remove it, or drag items from your bags or the vendor onto the grid. They show a bag icon in your bags.")
 
     panel:SetScript("OnShow", RefreshPanel)
 end
@@ -944,7 +1359,10 @@ local function CreateBar()
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:AddLine("AutoSellMinMax")
         GameTooltip:AddLine("Auto sell grey: " .. OnOff(db.autoSellGrey), 1, 1, 1)
-        GameTooltip:AddLine("Auto-sell list: " .. (db.perCharacter and "this character" or "all characters"), 1, 1, 1)
+        GameTooltip:AddLine("Sell/buy lists: " .. (db.perCharacter and "this character" or "all characters"), 1, 1, 1)
+        local nBuy = 0
+        for _ in pairs(BuyList()) do nBuy = nBuy + 1 end
+        GameTooltip:AddLine("Auto buy: " .. OnOff(db.autoBuy) .. " (" .. nBuy .. " item" .. (nBuy == 1 and "" or "s") .. ")", 1, 1, 1)
         GameTooltip:AddLine("Clean up bags after looting/selling: " .. OnOff(db.sortBags), 1, 1, 1)
         GameTooltip:AddLine("Auto repair: " .. OnOff(db.autoRepair)
             .. (db.autoRepair and db.repairGuildFunds and " (guild funds first)" or ""), 1, 1, 1)
@@ -978,7 +1396,8 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
         end
 
         Print("loaded. |cffffd100Alt+Left-click|r any item in your bags to register it for auto-selling (click again to unregister).")
-        Print("Auto-sell list: " .. (db.perCharacter and "|cffffd100this character only|r" or "|cffffd100shared by all characters|r") .. ".")
+        Print("|cffffd100Ctrl+Alt+Left-click|r an item to keep it stocked: it is bought at vendors until you have the amount you set. Auto buy: " .. OnOff(db.autoBuy) .. ".")
+        Print("Auto-sell and auto-buy lists: " .. (db.perCharacter and "|cffffd100this character only|r" or "|cffffd100shared by all characters|r") .. ".")
         Print("Auto clean up bags after looting and selling: " .. OnOff(db.sortBags) .. " (change it in the options).")
         Print("Auto repair at vendors: " .. OnOff(db.autoRepair)
             .. (db.autoRepair and db.repairGuildFunds and " (guild funds first)" or "") .. ".")
@@ -1004,12 +1423,18 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
         end
     elseif event == "MERCHANT_SHOW" then
         merchantOpen = true
-        SellItems(RepairItems) -- repair after selling, so the earned gold can pay for it
+        -- sell first, then repair and buy, so the earned gold can pay for both
+        SellItems(function()
+            local spent = RepairItems()
+            BuyItems(GetMoney() - spent)
+        end)
     elseif event == "MERCHANT_CLOSED" then
         merchantOpen = false
         StopSelling()
+        StopBuying()
     elseif event == "BAG_UPDATE_DELAYED" then
         RefreshOverlays()
+        if panel and panel:IsShown() then RefreshPanel() end
     end
 end)
 
