@@ -14,6 +14,7 @@ local defaults = {
     characters = {},      -- ["Name-Realm"] = { registered = {}, buy = {} }
     buy = {},             -- [itemID] = number of items to keep in the bags
     sortBags = true, -- clean up ("Taschen aufräumen") after looting and selling
+    markQuestItems = true,  -- mark quest items that no quest in the quest log mentions with a "?"
     autoRepair = true,       -- repair all gear at vendors that can repair
     repairGuildFunds = false, -- pay repairs from the guild bank first, when allowed
     block = { [2] = true, [3] = true, [4] = true, [5] = true }, -- green, blue, epic, legendary
@@ -879,6 +880,237 @@ local function BuyItems(budget)
 end
 
 ---------------------------------------------------------------------------
+-- Quest items that no quest in the quest log mentions (only marked, never sold or deleted)
+---------------------------------------------------------------------------
+
+local QUEST_ICON = "Interface\\GossipFrame\\ActiveQuestIcon"
+local questText              -- lower-case text of every quest in the log
+local questDirty = true
+local questIgnoreUntil = 0   -- our own quest log reads fire QUEST_LOG_UPDATE; ignore those
+
+local function AddText(parts, s)
+    if type(s) == "string" and s ~= "" then parts[#parts + 1] = s end
+end
+
+local questCount = 0          -- quests read from the log in the last scan
+local questWords = {}         -- [word] = true, every word of MIN_WORD+ bytes in the quest log
+local mentionCache = {}       -- [item name] = word that matched, or false
+local MIN_WORD = 5            -- shorter words ("the", "für", "des") match far too much
+
+-- Lower-case words of at least MIN_WORD bytes. Splits at spaces, punctuation and digits,
+-- so "Gahz'ridian-Detektor" gives "ridian" and "detektor" (umlauts are kept inside words).
+local function Words(s)
+    local t = {}
+    for w in s:lower():gmatch("[^%s%p%d]+") do
+        if #w >= MIN_WORD then t[#t + 1] = w end
+    end
+    return t
+end
+
+-- Capitalised words that are not item names (sentence starts, common words).
+local STOP_WORDS = {}
+for w in ([[bringt bringe bringen bitte diese dieser diesen dieses diesem einen einem einer eines
+    nicht werden wurde haben sollt sollte solltet könnt können kehrt kehre zurück sprecht sprich
+    findet finde sammelt sammle tötet töte vernichtet besorgt besorge welche welcher meine meinen
+    about there their these those which would could should bring return please speak collect
+    gather obtain retrieve slay travel]]):gmatch("%S+") do STOP_WORDS[w] = true end
+
+local UPPER_UMLAUT = { ["\195\132"] = true, ["\195\150"] = true, ["\195\156"] = true } -- Ä Ö Ü
+
+-- Capitalised words of the quest text (mostly nouns, also in German), lower-cased.
+local function NounWords(s)
+    local t = {}
+    for w in s:gmatch("[^%s%p%d]+") do
+        if #w >= MIN_WORD and (w:sub(1, 1):match("%u") or UPPER_UMLAUT[w:sub(1, 2)]) then
+            local lw = w:lower()
+            if not STOP_WORDS[lw] then t[lw] = true end
+        end
+    end
+    return t
+end
+
+local function BuildQuestText()
+    local parts = {}
+    questCount = 0
+    if C_QuestLog and C_QuestLog.GetNumQuestLogEntries and C_QuestLog.GetInfo then
+        -- newer clients
+        for i = 1, C_QuestLog.GetNumQuestLogEntries() do
+            local info = C_QuestLog.GetInfo(i)
+            if info and not info.isHeader then
+                questCount = questCount + 1
+                AddText(parts, info.title)
+                if C_QuestLog.GetQuestObjectives then
+                    for _, o in ipairs(C_QuestLog.GetQuestObjectives(info.questID) or {}) do AddText(parts, o.text) end
+                end
+                local ok, desc, obj = pcall(GetQuestLogQuestText, i)
+                if ok then AddText(parts, desc); AddText(parts, obj) end
+            end
+        end
+    elseif GetNumQuestLogEntries and GetQuestLogTitle then
+        -- classic clients: collapsed headers hide their quests, so expand them for the scan
+        local selected = GetQuestLogSelection and GetQuestLogSelection()
+        local collapsed = {}
+        for i = 1, (GetNumQuestLogEntries()) do
+            local title, _, _, isHeader, isCollapsed = GetQuestLogTitle(i)
+            if isHeader and isCollapsed and title then collapsed[title] = true end
+        end
+        if next(collapsed) and ExpandQuestHeader then ExpandQuestHeader(0) end
+
+        for i = 1, (GetNumQuestLogEntries()) do
+            local title, _, _, isHeader = GetQuestLogTitle(i)
+            if title and not isHeader then
+                questCount = questCount + 1
+                AddText(parts, title)
+                for j = 1, (GetNumQuestLeaderBoards and GetNumQuestLeaderBoards(i) or 0) do
+                    AddText(parts, (GetQuestLogLeaderBoard(j, i)))
+                end
+                -- description and objectives also name items you only have to deliver
+                if SelectQuestLogEntry and GetQuestLogQuestText then
+                    SelectQuestLogEntry(i)
+                    local desc, obj = GetQuestLogQuestText()
+                    AddText(parts, desc); AddText(parts, obj)
+                end
+            end
+        end
+
+        if next(collapsed) and CollapseQuestHeader then
+            for i = GetNumQuestLogEntries(), 1, -1 do -- backwards, so indexes stay valid
+                local title, _, _, isHeader = GetQuestLogTitle(i)
+                if isHeader and collapsed[title] then CollapseQuestHeader(i) end
+            end
+        end
+        if SelectQuestLogEntry then SelectQuestLogEntry(selected or 0) end
+    end
+    return table.concat(parts, "\n")
+end
+
+local function QuestText()
+    if questDirty or not questText then
+        local raw = BuildQuestText()
+        questText = raw:lower()
+        questWords, mentionCache = NounWords(raw), {}
+        questDirty = false
+        questIgnoreUntil = GetTime() + 1
+    end
+    return questText
+end
+
+-- Does any quest in the log mention this item? Returns the matching text, or nil.
+-- Compares whole words in both directions, so German compounds and word forms match too:
+--   1. the full item name appears in the quest text
+--   2. a word of the item name appears in the quest text   ("ridian" from Gahz'ridian-Detektor)
+--   3. a capitalised word of the quest text is part of the item name
+--      ("muisek" in Muisekgefäß, "pylon" in Pylonteilehaufen)
+local function QuestMention(name)
+    local text = QuestText()
+    local lname = name:lower()
+    local cached = mentionCache[lname]
+    if cached ~= nil then return cached or nil end
+
+    local found
+    if text:find(lname, 1, true) then
+        found = name
+    else
+        for _, w in ipairs(Words(lname)) do
+            if text:find(w, 1, true) then found = w; break end
+        end
+        if not found then
+            for w in pairs(questWords) do
+                if lname:find(w, 1, true) then found = w; break end
+            end
+        end
+    end
+    mentionCache[lname] = found or false
+    return found
+end
+
+local function OnQuestLogChanged()
+    if GetTime() < questIgnoreUntil then return end
+    questDirty = true
+end
+
+-- isQuestItem, questID (if the item starts a quest), isActive (that quest is in your log)
+local function ContainerQuestInfo(bag, slot)
+    if C_Container and C_Container.GetContainerItemQuestInfo then
+        local q = C_Container.GetContainerItemQuestInfo(bag, slot)
+        if q then return q.isQuestItem, q.questID, q.isActive end
+    elseif GetContainerItemQuestInfo then
+        return GetContainerItemQuestInfo(bag, slot)
+    end
+end
+
+local function IsQuestDone(questID)
+    if C_QuestLog and C_QuestLog.IsQuestFlaggedCompleted then return C_QuestLog.IsQuestFlaggedCompleted(questID) end
+    if IsQuestFlaggedCompleted then return IsQuestFlaggedCompleted(questID) end
+    return false
+end
+
+-- True if the bag slot holds a quest item that no quest in your quest log mentions.
+local function IsUnneededQuestItem(bag, slot, itemID)
+    if not (db.markQuestItems and itemID) then return false end -- option off: nothing is calculated
+    local isQuest, questID, isActive = ContainerQuestInfo(bag, slot)
+    if not (isQuest or questID or IsQuestItem(itemID)) then return false end
+    if questID then
+        if isActive then return false end
+        if not IsQuestDone(questID) then return false end -- starts a quest you can still take
+    end
+    local name = GetItemInfo(itemID)
+    if not name then return false end -- item data not loaded yet; check again later
+    QuestText()
+    if questCount == 0 then return false end -- quest log empty or not readable: better mark nothing
+    return not QuestMention(name)
+end
+
+-- /asmm quest: show how every quest item in the bags was judged.
+local function PrintQuestReport()
+    if not db.markQuestItems then
+        Print("quest item marking is |cffff0000OFF|r: no ? is shown in your bags. Turn it on in the options (minimap coin or /asmm). Check result:")
+    end
+    questDirty = true
+    QuestText()
+    Print(string.format("quest log: %d quests read, %d characters of quest text.", questCount, #questText))
+    local seen, n = {}, 0
+    for bag = 0, 4 do
+        for slot = 1, GetNumSlots(bag) do
+            local link = GetSlotInfo(bag, slot)
+            local id = ItemIDFromLink(link)
+            if id and not seen[id] then
+                seen[id] = true
+                local isQuest, questID, isActive = ContainerQuestInfo(bag, slot)
+                if isQuest or questID or IsQuestItem(id) then
+                    n = n + 1
+                    local name = GetItemInfo(id) or ("item " .. id)
+                    local why
+                    if questID and isActive then
+                        why = "|cff40ff40kept|r: starts a quest that is in your log"
+                    elseif questID and not IsQuestDone(questID) then
+                        why = "|cff40ff40kept|r: starts a quest you have not done yet"
+                    else
+                        local hit = QuestMention(name)
+                        why = hit and ("|cff40ff40kept|r: quest log mentions \"" .. hit .. "\"")
+                            or "|cffffd100? marked|r: no quest mentions it"
+                    end
+                    Print("  " .. ItemLink(id, link) .. " - " .. why)
+                end
+            end
+        end
+    end
+    if n == 0 then Print("  no quest items in your bags.") end
+end
+
+local function HookQuestTooltip()
+    if not (GameTooltip and GameTooltip.SetBagItem) then return end
+    hooksecurefunc(GameTooltip, "SetBagItem", function(tt, bag, slot)
+        local id = ItemIDFromLink((GetSlotInfo(bag, slot)))
+        if IsUnneededQuestItem(bag, slot, id) then
+            tt:AddLine("|T" .. QUEST_ICON .. ":0|t No quest for this quest item was found in your quest log.", 1, 0.82, 0, true)
+            tt:AddLine("It is probably no longer needed. AutoSellMinMax only marks it, it never sells or deletes it.", 0.7, 0.7, 0.7, true)
+            tt:Show()
+        end
+    end)
+end
+
+---------------------------------------------------------------------------
 -- Bag overlays (small coin on registered items)
 ---------------------------------------------------------------------------
 
@@ -952,12 +1184,21 @@ function UpdateButtonOverlay(button)
     if not button or not button.GetID then return end
     HookButton(button)
     local bag, slot = ButtonBagSlot(button)
-    local show, buy = false, false
+    local show, buy, quest = false, false, false
     if bag and slot then
         local id = ItemIDFromLink((GetSlotInfo(bag, slot)))
         show = IsRegistered(id)
         buy = id and BuyList()[id] and true or false
+        quest = IsUnneededQuestItem(bag, slot, id)
     end
+    if quest and not button.asmmQuest then
+        local tex = button:CreateTexture(nil, "OVERLAY", nil, 7)
+        tex:SetTexture(QUEST_ICON)
+        tex:SetSize(16, 16)
+        tex:SetPoint("BOTTOMLEFT", 1, 1)
+        button.asmmQuest = tex
+    end
+    if button.asmmQuest then SetShown(button.asmmQuest, quest) end
     if show and not button.asmmCoin then
         local tex = button:CreateTexture(nil, "OVERLAY", nil, 7)
         tex:SetTexture("Interface/Icons/INV_Misc_Coin_01")
@@ -1208,7 +1449,7 @@ end
 local function CreatePanel()
     panel = CreateFrame("Frame", "AutoSellMinMaxPanel", UIParent,
         BackdropTemplateMixin and "BackdropTemplate" or nil)
-    panel:SetSize(COL2_X + GRID_W + 18, 560)
+    panel:SetSize(COL2_X + GRID_W + 18, 586)
     panel:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -10, -200)
     if panel.SetClampedToScreen then panel:SetClampedToScreen(true) end
     panel:SetFrameStrata("DIALOG")
@@ -1254,6 +1495,15 @@ local function CreatePanel()
     Check("Clean up bags after looting and selling",
         function() return db.sortBags end,
         function(v) db.sortBags = v end)
+    y = y - 26
+    Check("Mark quest items no quest needs with |T" .. QUEST_ICON .. ":0|t",
+        function() return db.markQuestItems end,
+        function(v)
+            db.markQuestItems = v
+            questDirty = true -- read the quest log fresh when turned on
+            RefreshOverlays()
+            Print("quest item marking: " .. OnOff(v) .. (v and " (only marked, never sold or deleted)." or "."))
+        end)
     y = y - 26
     Check("Auto repair all items at vendors",
         function() return db.autoRepair end,
@@ -1607,6 +1857,7 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
         CreateBar()
         CreatePanel()
         CreateInfoPanel()
+        HookQuestTooltip()
 
         -- Alt+Left-click handling is hooked per bag button in RefreshOverlays.
         RefreshOverlays()
@@ -1622,6 +1873,7 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
         Print("Auto repair at vendors: " .. OnOff(db.autoRepair)
             .. (db.autoRepair and db.repairGuildFunds and " (guild funds first)" or "") .. ".")
         Print("Registered items are marked with a coin and sold automatically at the next vendor. Click the minimap coin or type /asmm for options.")
+        Print("Mark quest items no quest needs with |T" .. QUEST_ICON .. ":0|t: " .. OnOff(db.markQuestItems) .. " (change it in the options).")
 
         f:UnregisterEvent("ADDON_LOADED")
         pcall(f.RegisterEvent, f, "GLOBAL_MOUSE_DOWN")
@@ -1630,6 +1882,10 @@ f:SetScript("OnEvent", function(_, event, arg1, ...)
         f:RegisterEvent("MERCHANT_SHOW")
         f:RegisterEvent("MERCHANT_CLOSED")
         f:RegisterEvent("BAG_UPDATE_DELAYED")
+        f:RegisterEvent("QUEST_LOG_UPDATE")
+    elseif event == "QUEST_LOG_UPDATE" then
+        OnQuestLogChanged()
+        if db.markQuestItems then RefreshOverlays() end
     elseif event == "GLOBAL_MOUSE_DOWN" then
         OnGlobalMouseDown(arg1)
     elseif event == "CHAT_MSG_LOOT" then
@@ -1661,6 +1917,11 @@ end)
 SLASH_AUTOSELLMINMAX1 = "/asmm"
 SLASH_AUTOSELLMINMAX2 = "/autosellminmax"
 SlashCmdList["AUTOSELLMINMAX"] = function(msg)
+    if msg and msg:lower():match("^%s*quest") then
+        PrintQuestReport()
+        RefreshOverlays()
+        return
+    end
     if msg and msg:lower():match("^%s*debug") then
         debugClicks = not debugClicks
         Print("click debug " .. (debugClicks and "ON" or "OFF"))

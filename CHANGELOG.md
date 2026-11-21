@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0
+
+- **New: unneeded quest items are marked.** Quest items in your bags that no quest in your quest log mentions get a yellow **?** in the bottom-left corner. The tooltip says: *"No quest for this quest item was found in your quest log."*
+  - New option "Mark quest items no quest needs with ?" (**on by default**, saved between sessions). While it is off, nothing is calculated: the quest log is not read, and no symbol or tooltip line is shown.
+  - The quest log is checked by quest title, objectives (e.g. "Wolf Fur: 3/10"), quest description and objective text, so items you only have to deliver are recognised too.
+  - Names are compared word by word in both directions, so quest tools and German compound words are recognised: *Gahz'ridian-Detektor* matches a quest about *Gahz'ridian-Schmuck*, *Muisekgefäß* matches a quest that mentions *Muisek*. Only words with 5 or more letters count, and from the quest text only capitalised words (mostly nouns).
+  - If the quest log cannot be read or is empty, nothing is marked.
+  - New command `/asmm quest`: lists every quest item in your bags and why it is marked or kept (e.g. which word of the quest log matched).
+  - Items that start a quest you have not done yet are not marked.
+  - Quests under collapsed headers in the quest log are included.
+  - The marking is only a hint: AutoSellMinMax **never sells or deletes** quest items. Delete them yourself if you are sure you no longer need them.
+
 ## 1.1.1
 
 - Fixed auto-buy buying more than the amount you set. Items that vendors sell in packs (for example water in packs of 5) were always rounded up: with 2 water and a target of 20, four packs were bought and you ended up with 22. By default, only whole packs that still fit under the target are bought now (2 + 15 = 17 in this example).
