@@ -2,7 +2,7 @@
 
 ## 1.2.0
 
-- **New: unneeded quest items are marked.** Quest items in your bags that no quest in your quest log mentions get a yellow **?** in the bottom-left corner. The tooltip says: *"No quest for this quest item was found in your quest log."*
+- **New: unneeded quest items are marked.** Quest items in your bags that no quest in your quest log mentions get a yellow **?** in the bottom-left corner. The tooltip says: *"AutoSellMinMax: No quest for this quest item was found in your quest log."* (the addon name shows that the hint comes from AutoSellMinMax, not from the game)
   - New option "Mark quest items no quest needs with ?" (**on by default**, saved between sessions). While it is off, nothing is calculated: the quest log is not read, and no symbol or tooltip line is shown.
   - The quest log is checked by quest title, objectives (e.g. "Wolf Fur: 3/10"), quest description and objective text, so items you only have to deliver are recognised too.
   - Names are compared word by word in both directions, so quest tools and German compound words are recognised: *Gahz'ridian-Detektor* matches a quest about *Gahz'ridian-Schmuck*, *Muisekgefäß* matches a quest that mentions *Muisek*. Only words with 5 or more letters count, and from the quest text only capitalised words (mostly nouns).

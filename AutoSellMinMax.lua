@@ -1103,7 +1103,7 @@ local function HookQuestTooltip()
     hooksecurefunc(GameTooltip, "SetBagItem", function(tt, bag, slot)
         local id = ItemIDFromLink((GetSlotInfo(bag, slot)))
         if IsUnneededQuestItem(bag, slot, id) then
-            tt:AddLine("|T" .. QUEST_ICON .. ":0|t No quest for this quest item was found in your quest log.", 1, 0.82, 0, true)
+            tt:AddLine("|T" .. QUEST_ICON .. ":0|t |cff33ff99AutoSellMinMax:|r No quest for this quest item was found in your quest log.", 1, 0.82, 0, true)
             tt:AddLine("It is probably no longer needed. AutoSellMinMax only marks it, it never sells or deletes it.", 0.7, 0.7, 0.7, true)
             tt:Show()
         end
